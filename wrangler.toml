@@ -1,0 +1,32 @@
+name = "reportli-business-ai-analyzer"
+
+main = "src/index.js"
+
+compatibility_date = "2026-09-27"
+
+
+# ============================================================
+# QUEUE PRODUCER
+# ============================================================
+
+[[queues.producers]]
+binding = "AI_ANALYSIS_QUEUE"
+queue = "business-ai-analysis"
+
+
+# ============================================================
+# QUEUE CONSUMER
+# ============================================================
+
+[[queues.consumers]]
+queue = "business-ai-analysis"
+
+max_batch_size = 1
+
+max_batch_timeout = 5
+
+max_retries = 5
+
+retry_delay = 60
+
+max_concurrency = 1
