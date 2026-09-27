@@ -24,7 +24,8 @@ const SARVAM_URL =
 const SARVAM_MODEL =
   "sarvam-105b";
 
-const MAX_TEXT_CHARS = 100000;
+const MAX_TEXT_CHARS =
+  100000;
 
 
 // ============================================================
@@ -192,7 +193,9 @@ export default {
         payload =
           JSON.parse(rawBody);
 
-      } catch (error) {
+      }
+
+      catch (error) {
 
         console.error(
           "[3] JSON parsing failed"
@@ -228,27 +231,74 @@ export default {
       // ======================================================
 
       //
-      // Normal Supabase Database Webhook:
+      // IMPORTANT:
+      //
+      // Your current Supabase webhook sends the
+      // business_data row DIRECTLY:
       //
       // {
-      //   "type": "INSERT",
-      //   "table": "business_data",
-      //   "schema": "public",
-      //   "record": {...},
-      //   "old_record": null
+      //   "id": "...",
+      //   "application_id": "...",
+      //   "field": "page",
+      //   "data": {...},
+      //   "ai_status": "pending"
       // }
       //
-      // We also support alternative structures.
+      // It does NOT send:
+      //
+      // {
+      //   "record": {...}
+      // }
+      //
+      // Therefore we first detect the direct row.
+      //
+      // We ALSO support the normal wrapped format.
       //
 
 
       let record = null;
 
 
+      // ======================================================
+      // FORMAT 1
+      // DIRECT BUSINESS_DATA ROW
+      // ======================================================
+
       if (
         payload &&
-        payload.record
+        typeof payload === "object" &&
+        !Array.isArray(payload) &&
+        payload.id &&
+        payload.application_id &&
+        payload.field
       ) {
+
+        console.log(
+          "[4] Direct business_data row detected"
+        );
+
+
+        record =
+          payload;
+
+      }
+
+
+      // ======================================================
+      // FORMAT 2
+      // STANDARD SUPABASE WEBHOOK
+      // ======================================================
+
+      else if (
+        payload &&
+        payload.record &&
+        typeof payload.record === "object"
+      ) {
+
+        console.log(
+          "[4] payload.record detected"
+        );
+
 
         record =
           payload.record;
@@ -256,10 +306,21 @@ export default {
       }
 
 
+      // ======================================================
+      // FORMAT 3
+      // new_record
+      // ======================================================
+
       else if (
         payload &&
-        payload.new_record
+        payload.new_record &&
+        typeof payload.new_record === "object"
       ) {
+
+        console.log(
+          "[4] payload.new_record detected"
+        );
+
 
         record =
           payload.new_record;
@@ -267,11 +328,22 @@ export default {
       }
 
 
+      // ======================================================
+      // FORMAT 4
+      // data.record
+      // ======================================================
+
       else if (
         payload &&
         payload.data &&
-        payload.data.record
+        payload.data.record &&
+        typeof payload.data.record === "object"
       ) {
+
+        console.log(
+          "[4] payload.data.record detected"
+        );
+
 
         record =
           payload.data.record;
@@ -279,42 +351,25 @@ export default {
       }
 
 
+      // ======================================================
+      // FORMAT 5
+      // data.new_record
+      // ======================================================
+
       else if (
         payload &&
         payload.data &&
-        payload.data.new_record
+        payload.data.new_record &&
+        typeof payload.data.new_record === "object"
       ) {
+
+        console.log(
+          "[4] payload.data.new_record detected"
+        );
+
 
         record =
           payload.data.new_record;
-
-      }
-
-
-      else if (
-        payload &&
-        payload.data &&
-        typeof payload.data === "object" &&
-        !Array.isArray(payload.data)
-      ) {
-
-        //
-        // Last fallback.
-        //
-        // Only use this if it actually looks like
-        // a business_data row.
-        //
-
-        if (
-          payload.data.id ||
-          payload.data.application_id ||
-          payload.data.field
-        ) {
-
-          record =
-            payload.data;
-
-        }
 
       }
 
@@ -339,6 +394,7 @@ export default {
 
             received_payload:
               payload
+
           },
 
           400
@@ -361,6 +417,13 @@ export default {
       // STEP 5
       // EVENT TYPE
       // ======================================================
+
+      //
+      // Your current webhook sends the row directly and
+      // therefore does not include "type".
+      //
+      // In that situation we assume INSERT.
+      //
 
       const eventType =
         payload?.type ||
@@ -403,6 +466,11 @@ export default {
       // STEP 6
       // TABLE
       // ======================================================
+
+      //
+      // Your direct webhook payload does not contain
+      // a table name, so default to business_data.
+      //
 
       const tableName =
         payload?.table ||
@@ -619,7 +687,9 @@ export default {
       });
 
 
-    } catch (error) {
+    }
+
+    catch (error) {
 
       console.error(
         "[WORKER] ========================================"
@@ -767,10 +837,6 @@ async function processBusinessData(
       record.data !== null &&
       record.data !== undefined
     ) {
-
-      //
-      // jsonb object/array
-      //
 
       rawText =
         JSON.stringify(
@@ -1334,7 +1400,9 @@ function cleanExtractedObject(
   ) {
 
     if (!rawKey) {
+
       continue;
+
     }
 
 
@@ -1349,7 +1417,9 @@ function cleanExtractedObject(
 
 
     if (!field) {
+
       continue;
+
     }
 
 
@@ -1842,4 +1912,4 @@ function corsHeaders() {
 
   };
 
-        }
+    }
