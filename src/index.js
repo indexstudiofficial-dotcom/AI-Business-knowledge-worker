@@ -1,1511 +1,377 @@
 // ============================================================
-// AI BUSINESS KNOWLEDGE WORKER
+// AI BUSINESS KNOWLEDGE WORKER (fixed)
 // ============================================================
 //
 // FLOW:
 //
 // Supabase business_data INSERT
 //          ↓
-// Supabase Database Webhook
+// Supabase Database Webhook  (trigger only — payload may be
+//                              truncated/stale for large rows)
 //          ↓
 // Cloudflare Worker
-//          ↓
-// Sarvam AI
+//          ↓ re-fetches the row FRESH by id
+// Sarvam AI  (short prompt)
 //          ↓
 // business_knowledge
 //          ↓
 // business_data.ai_status = completed
 //
+// FIXES vs previous version:
+// - The webhook payload is only used to get `id` / `application_id`
+//   / `field`. The actual text we send to the AI is fetched fresh
+//   with a GET on business_data?id=eq.<id> right before processing.
+//   This is the main fix: Supabase webhook payloads can be
+//   truncated or missing large `data` values, which was the
+//   likely cause of intermittent failures / empty extractions.
+// - Prompt shortened significantly (same rules, far fewer tokens).
+// - MAX_TEXT_CHARS lowered from 100k to 40k — large inputs were
+//   more likely to hit Sarvam token/timeout limits.
+// - Added a small retry (2 attempts) around the Sarvam call for
+//   transient 429/5xx errors instead of failing immediately.
+// - ai_status set to "failed" with the error message stored, so
+//   failures are visible in the table instead of only in logs.
 // ============================================================
 
-const SARVAM_URL =
-  "https://api.sarvam.ai/v1/chat/completions";
-
-const SARVAM_MODEL =
-  "sarvam-105b";
-
-const MAX_TEXT_CHARS =
-  100000;
-
-
-// ============================================================
-// WORKER
-// ============================================================
+const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
+const SARVAM_MODEL = "sarvam-105b";
+const MAX_TEXT_CHARS = 40000;
+const SARVAM_MAX_RETRIES = 2;
 
 export default {
-
-  // ==========================================================
-  // HTTP HANDLER
-  // ==========================================================
-
   async fetch(request, env) {
-
-    console.log("========================================");
-    console.log("[WORKER] AI BUSINESS KNOWLEDGE WORKER");
-    console.log("[WORKER] Request received");
-    console.log("[WORKER] Method:", request.method);
-    console.log("[WORKER] URL:", request.url);
-    console.log("========================================");
-
-
-    // ========================================================
-    // CORS
-    // ========================================================
-
     if (request.method === "OPTIONS") {
-
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders()
-      });
-
+      return new Response(null, { status: 204, headers: corsHeaders() });
     }
-
-
-    // ========================================================
-    // HEALTH CHECK
-    // ========================================================
 
     if (request.method === "GET") {
-
       return jsonResponse({
-
         success: true,
-
-        worker:
-          "ai-business-knowledge-worker",
-
-        status:
-          "alive",
-
-        expected_webhook_method:
-          "POST"
-
+        worker: "ai-business-knowledge-worker",
+        status: "alive",
+        expected_webhook_method: "POST"
       });
-
     }
-
-
-    // ========================================================
-    // ONLY POST
-    // ========================================================
 
     if (request.method !== "POST") {
-
-      return jsonResponse(
-        {
-          success: false,
-
-          error:
-            "Only POST requests are allowed"
-        },
-
-        405
-      );
-
+      return jsonResponse({ success: false, error: "Only POST requests are allowed" }, 405);
     }
-
 
     try {
+      if (!env.SUPABASE_URL) throw new Error("SUPABASE_URL is missing");
+      if (!env.SUPABASE_SERVICE_ROLE_KEY) throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing");
+      if (!env.SARVAM_API_KEY) throw new Error("SARVAM_API_KEY is missing");
 
-      // ======================================================
-      // STEP 1
-      // CHECK SECRETS
-      // ======================================================
-
-      console.log(
-        "[1] Checking environment variables..."
-      );
-
-
-      if (!env.SUPABASE_URL) {
-
-        throw new Error(
-          "SUPABASE_URL is missing"
-        );
-
-      }
-
-
-      if (!env.SUPABASE_SERVICE_ROLE_KEY) {
-
-        throw new Error(
-          "SUPABASE_SERVICE_ROLE_KEY is missing"
-        );
-
-      }
-
-
-      if (!env.SARVAM_API_KEY) {
-
-        throw new Error(
-          "SARVAM_API_KEY is missing"
-        );
-
-      }
-
-
-      console.log(
-        "[1] Environment variables OK"
-      );
-
-
-      // ======================================================
-      // STEP 2
-      // READ REQUEST BODY
-      // ======================================================
-
-      const rawBody =
-        await request.text();
-
-
-      console.log(
-        "[2] Request body length:",
-        rawBody.length
-      );
-
-
-      console.log(
-        "[2] Request body:",
-        rawBody
-      );
-
-
-      if (!rawBody) {
-
-        throw new Error(
-          "Webhook request body is empty"
-        );
-
-      }
-
-
-      // ======================================================
-      // STEP 3
-      // PARSE JSON
-      // ======================================================
+      const rawBody = await request.text();
+      if (!rawBody) throw new Error("Webhook request body is empty");
 
       let payload;
-
-
       try {
-
-        payload =
-          JSON.parse(rawBody);
-
+        payload = JSON.parse(rawBody);
+      } catch {
+        throw new Error("Webhook body is not valid JSON");
       }
 
-      catch (error) {
-
-        console.error(
-          "[3] JSON parsing failed"
-        );
-
-        throw new Error(
-          "Webhook body is not valid JSON"
-        );
-
-      }
-
-
-      console.log(
-        "[3] Payload received"
-      );
-
-
-      console.log(
-        "[3] Payload keys:",
-        Object.keys(payload || {})
-      );
-
-
-      console.log(
-        "[3] Full payload:",
-        JSON.stringify(payload)
-      );
-
-
-      // ======================================================
-      // STEP 4
-      // FIND RECORD
-      // ======================================================
-
-      //
-      // IMPORTANT:
-      //
-      // Your current Supabase webhook sends the
-      // business_data row DIRECTLY:
-      //
-      // {
-      //   "id": "...",
-      //   "application_id": "...",
-      //   "field": "page",
-      //   "data": {...},
-      //   "ai_status": "pending"
-      // }
-      //
-      // It does NOT send:
-      //
-      // {
-      //   "record": {...}
-      // }
-      //
-      // Therefore we first detect the direct row.
-      //
-      // We ALSO support the normal wrapped format.
-      //
-
-
-      let record = null;
-
-
-      // ======================================================
-      // FORMAT 1
-      // DIRECT BUSINESS_DATA ROW
-      // ======================================================
-
-      if (
-        payload &&
-        typeof payload === "object" &&
-        !Array.isArray(payload) &&
-        payload.id &&
-        payload.application_id &&
-        payload.field
-      ) {
-
-        console.log(
-          "[4] Direct business_data row detected"
-        );
-
-
-        record =
-          payload;
-
-      }
-
-
-      // ======================================================
-      // FORMAT 2
-      // STANDARD SUPABASE WEBHOOK
-      // ======================================================
-
-      else if (
-        payload &&
-        payload.record &&
-        typeof payload.record === "object"
-      ) {
-
-        console.log(
-          "[4] payload.record detected"
-        );
-
-
-        record =
-          payload.record;
-
-      }
-
-
-      // ======================================================
-      // FORMAT 3
-      // new_record
-      // ======================================================
-
-      else if (
-        payload &&
-        payload.new_record &&
-        typeof payload.new_record === "object"
-      ) {
-
-        console.log(
-          "[4] payload.new_record detected"
-        );
-
-
-        record =
-          payload.new_record;
-
-      }
-
-
-      // ======================================================
-      // FORMAT 4
-      // data.record
-      // ======================================================
-
-      else if (
-        payload &&
-        payload.data &&
-        payload.data.record &&
-        typeof payload.data.record === "object"
-      ) {
-
-        console.log(
-          "[4] payload.data.record detected"
-        );
-
-
-        record =
-          payload.data.record;
-
-      }
-
-
-      // ======================================================
-      // FORMAT 5
-      // data.new_record
-      // ======================================================
-
-      else if (
-        payload &&
-        payload.data &&
-        payload.data.new_record &&
-        typeof payload.data.new_record === "object"
-      ) {
-
-        console.log(
-          "[4] payload.data.new_record detected"
-        );
-
-
-        record =
-          payload.data.new_record;
-
-      }
-
-
-      // ======================================================
-      // RECORD NOT FOUND
-      // ======================================================
+      // Find the record reference in whatever shape the webhook sent it.
+      const record =
+        (payload?.id && payload?.application_id && payload?.field && payload) ||
+        payload?.record ||
+        payload?.new_record ||
+        payload?.data?.record ||
+        payload?.data?.new_record ||
+        null;
 
       if (!record) {
-
-        console.error(
-          "[4] BUSINESS_DATA RECORD NOT FOUND"
-        );
-
-
+        console.error("[WEBHOOK] Record not found in payload:", JSON.stringify(payload));
         return jsonResponse(
-          {
-            success: false,
-
-            error:
-              "Could not find business_data record in webhook payload",
-
-            received_payload:
-              payload
-
-          },
-
+          { success: false, error: "Could not find business_data record in webhook payload" },
           400
         );
-
       }
 
-
-      console.log(
-        "[4] Business data record found:"
-      );
-
-
-      console.log(
-        JSON.stringify(record)
-      );
-
-
-      // ======================================================
-      // STEP 5
-      // EVENT TYPE
-      // ======================================================
-
-      //
-      // Your current webhook sends the row directly and
-      // therefore does not include "type".
-      //
-      // In that situation we assume INSERT.
-      //
-
-      const eventType =
-        payload?.type ||
-        payload?.event ||
-        payload?.operation ||
-        "INSERT";
-
-
-      console.log(
-        "[5] Event type:",
-        eventType
-      );
-
-
-      if (
-        String(eventType).toUpperCase() !==
-        "INSERT"
-      ) {
-
-        console.log(
-          "[5] Ignoring non-INSERT event"
-        );
-
-
-        return jsonResponse({
-
-          success: true,
-
-          skipped: true,
-
-          reason:
-            "Only INSERT events are processed"
-
-        });
-
+      const eventType = payload?.type || payload?.event || payload?.operation || "INSERT";
+      if (String(eventType).toUpperCase() !== "INSERT") {
+        return jsonResponse({ success: true, skipped: true, reason: "Only INSERT events are processed" });
       }
 
-
-      // ======================================================
-      // STEP 6
-      // TABLE
-      // ======================================================
-
-      //
-      // Your direct webhook payload does not contain
-      // a table name, so default to business_data.
-      //
-
-      const tableName =
-        payload?.table ||
-        payload?.table_name ||
-        "business_data";
-
-
-      console.log(
-        "[6] Table:",
-        tableName
-      );
-
-
-      if (
-        tableName !==
-        "business_data"
-      ) {
-
-        return jsonResponse({
-
-          success: true,
-
-          skipped: true,
-
-          reason:
-            "Not business_data table"
-
-        });
-
+      const tableName = payload?.table || payload?.table_name || "business_data";
+      if (tableName !== "business_data") {
+        return jsonResponse({ success: true, skipped: true, reason: "Not business_data table" });
       }
 
+      const businessDataId = record.id;
+      const applicationId = record.application_id;
+      const field = record.field;
+      const aiStatus = record.ai_status;
 
-      // ======================================================
-      // STEP 7
-      // GET RECORD VALUES
-      // ======================================================
+      if (!businessDataId) throw new Error("business_data record ID is missing");
+      if (!applicationId) throw new Error("application_id is missing");
+      if (!field) throw new Error("field is missing");
 
-      const businessDataId =
-        record.id;
-
-
-      const applicationId =
-        record.application_id;
-
-
-      const field =
-        record.field;
-
-
-      const aiStatus =
-        record.ai_status;
-
-
-      console.log(
-        "[7] business_data ID:",
-        businessDataId
-      );
-
-
-      console.log(
-        "[7] application_id:",
-        applicationId
-      );
-
-
-      console.log(
-        "[7] field:",
-        field
-      );
-
-
-      console.log(
-        "[7] ai_status:",
-        aiStatus
-      );
-
-
-      // ======================================================
-      // VALIDATION
-      // ======================================================
-
-      if (!businessDataId) {
-
-        throw new Error(
-          "business_data record ID is missing"
-        );
-
+      if (field !== "page") {
+        return jsonResponse({ success: true, skipped: true, reason: "Only field=page is processed" });
       }
 
-
-      if (!applicationId) {
-
-        throw new Error(
-          "application_id is missing"
-        );
-
+      if (aiStatus && aiStatus !== "pending") {
+        return jsonResponse({ success: true, skipped: true, reason: `ai_status is ${aiStatus}` });
       }
 
-
-      if (!field) {
-
-        throw new Error(
-          "field is missing"
-        );
-
-      }
-
-
-      // ======================================================
-      // STEP 8
-      // ONLY PROCESS PAGE
-      // ======================================================
-
-      if (
-        field !==
-        "page"
-      ) {
-
-        console.log(
-          "[8] Ignoring field:",
-          field
-        );
-
-
-        return jsonResponse({
-
-          success: true,
-
-          skipped: true,
-
-          reason:
-            "Only field=page is processed"
-
-        });
-
-      }
-
-
-      // ======================================================
-      // STEP 9
-      // ONLY PROCESS PENDING
-      // ======================================================
-
-      if (
-        aiStatus &&
-        aiStatus !== "pending"
-      ) {
-
-        console.log(
-          "[9] Ignoring because ai_status =",
-          aiStatus
-        );
-
-
-        return jsonResponse({
-
-          success: true,
-
-          skipped: true,
-
-          reason:
-            `ai_status is ${aiStatus}`
-
-        });
-
-      }
-
-
-      // ======================================================
-      // STEP 10
-      // PROCESS
-      // ======================================================
-
-      console.log(
-        "[10] Starting AI processing..."
-      );
-
-
-      await processBusinessData(
-        record,
-        env
-      );
-
-
-      // ======================================================
-      // SUCCESS
-      // ======================================================
-
-      console.log(
-        "[WORKER] ========================================"
-      );
-
-      console.log(
-        "[WORKER] PROCESSING COMPLETED"
-      );
-
-      console.log(
-        "[WORKER] ========================================"
-      );
-
+      await processBusinessData(businessDataId, applicationId, env);
 
       return jsonResponse({
-
         success: true,
-
         processed: true,
-
-        business_data_id:
-          businessDataId,
-
-        application_id:
-          applicationId
-
+        business_data_id: businessDataId,
+        application_id: applicationId
       });
 
-
+    } catch (error) {
+      console.error("[WORKER] ERROR:", error);
+      return jsonResponse({ success: false, error: error?.message || String(error) }, 500);
     }
-
-    catch (error) {
-
-      console.error(
-        "[WORKER] ========================================"
-      );
-
-      console.error(
-        "[WORKER] ERROR"
-      );
-
-      console.error(
-        error
-      );
-
-      console.error(
-        "[WORKER] ========================================"
-      );
-
-
-      return jsonResponse(
-
-        {
-          success: false,
-
-          error:
-            error?.message ||
-            String(error)
-
-        },
-
-        500
-
-      );
-
-    }
-
   },
 
-
-  // ==========================================================
-  // OLD CLOUDFLARE QUEUE HANDLER
-  // ==========================================================
-  //
-  // Your Worker still has an old Queue consumer attached.
-  //
-  // We are NOT using this Queue for the AI workflow.
-  //
-  // This handler only exists so Cloudflare accepts the Worker.
-  //
-  // ==========================================================
-
+  // Old queue consumer kept only so Cloudflare accepts the worker.
   async queue(batch) {
-
-    console.log(
-      "[QUEUE] Old Queue message received"
-    );
-
-
-    console.log(
-      "[QUEUE] Message count:",
-      batch.messages.length
-    );
-
-
-    for (
-      const message
-      of batch.messages
-    ) {
-
-      console.log(
-        "[QUEUE] Ignoring old message"
-      );
-
-
+    for (const message of batch.messages) {
       message.ack();
-
     }
-
-
-    console.log(
-      "[QUEUE] Old messages acknowledged"
-    );
-
   }
-
 };
-
 
 // ============================================================
 // PROCESS BUSINESS DATA
 // ============================================================
 
-async function processBusinessData(
-  record,
-  env
-) {
-
-  const id =
-    record.id;
-
-
+async function processBusinessData(id, applicationId, env) {
   try {
+    await updateStatus(id, "processing", env);
 
-    // ========================================================
-    // STEP A
-    // MARK PROCESSING
-    // ========================================================
+    // ----------------------------------------------------------
+    // Always fetch the FRESH row instead of trusting the webhook
+    // payload's `data` field, which can be truncated or stale.
+    // ----------------------------------------------------------
+    const freshRow = await fetchBusinessDataRow(id, env);
 
-    console.log(
-      "[PROCESS A] Setting status = processing"
-    );
-
-
-    await updateStatus(
-      id,
-      "processing",
-      env
-    );
-
-
-    // ========================================================
-    // STEP B
-    // GET RAW WEBSITE TEXT
-    // ========================================================
-
-    console.log(
-      "[PROCESS B] Reading business_data.data"
-    );
-
+    if (!freshRow) {
+      throw new Error(`business_data row ${id} not found on fresh fetch`);
+    }
 
     let rawText;
-
-
-    if (
-      typeof record.data ===
-      "string"
-    ) {
-
-      rawText =
-        record.data;
-
+    if (typeof freshRow.data === "string") {
+      rawText = freshRow.data;
+    } else if (freshRow.data !== null && freshRow.data !== undefined) {
+      rawText = JSON.stringify(freshRow.data);
+    } else {
+      throw new Error("business_data.data is empty");
     }
 
+    rawText = rawText.trim();
+    if (!rawText) throw new Error("business_data.data contains no text");
 
-    else if (
-      record.data !== null &&
-      record.data !== undefined
-    ) {
-
-      rawText =
-        JSON.stringify(
-          record.data
-        );
-
+    if (rawText.length > MAX_TEXT_CHARS) {
+      rawText = rawText.substring(0, MAX_TEXT_CHARS);
     }
 
-
-    else {
-
-      throw new Error(
-        "business_data.data is empty"
-      );
-
-    }
-
-
-    rawText =
-      rawText.trim();
-
-
-    if (!rawText) {
-
-      throw new Error(
-        "business_data.data contains no text"
-      );
-
-    }
-
-
-    // ========================================================
-    // LIMIT TEXT
-    // ========================================================
-
-    if (
-      rawText.length >
-      MAX_TEXT_CHARS
-    ) {
-
-      console.log(
-        "[PROCESS B] Text too large. Truncating."
-      );
-
-
-      rawText =
-        rawText.substring(
-          0,
-          MAX_TEXT_CHARS
-        );
-
-    }
-
-
-    console.log(
-      "[PROCESS B] Text characters:",
-      rawText.length
-    );
-
-
-    // ========================================================
-    // STEP C
-    // CALL SARVAM
-    // ========================================================
-
-    console.log(
-      "[PROCESS C] Sending data to Sarvam..."
-    );
-
-
-    const extractedData =
-      await callSarvam(
-        rawText,
-        record.source_url ||
-          "",
-        env
-      );
-
-
-    console.log(
-      "[PROCESS C] Sarvam returned successfully"
-    );
-
-
-    console.log(
-      "[PROCESS C] Extracted fields:",
-      Object.keys(
-        extractedData
-      )
-    );
-
-
-    // ========================================================
-    // STEP D
-    // SAVE KNOWLEDGE
-    // ========================================================
-
-    const fields =
-      Object.entries(
-        extractedData
-      );
-
-
-    if (
-      fields.length === 0
-    ) {
-
-      throw new Error(
-        "Sarvam extracted no business information"
-      );
-
-    }
-
-
-    for (
-      const [
-        field,
-        value
-      ]
-      of fields
-    ) {
-
-      if (
-        value === null ||
-        value === undefined ||
-        value === ""
-      ) {
-
-        continue;
-
-      }
-
-
-      console.log(
-        `[PROCESS D] Saving field: ${field}`
-      );
-
-
-      await saveKnowledge(
-        record.application_id,
-        field,
-        value,
-        env
-      );
-
-    }
-
-
-    // ========================================================
-    // STEP E
-    // COMPLETED
-    // ========================================================
-
-    console.log(
-      "[PROCESS E] Setting status = completed"
-    );
-
-
-    await updateStatus(
-      id,
-      "completed",
+    const extractedData = await callSarvamWithRetry(
+      rawText,
+      freshRow.source_url || "",
       env
     );
 
+    const fields = Object.entries(extractedData);
+    if (fields.length === 0) {
+      throw new Error("Sarvam extracted no business information");
+    }
 
-    console.log(
-      "[PROCESS] SUCCESS"
-    );
+    for (const [field, value] of fields) {
+      if (value === null || value === undefined || value === "") continue;
+      await saveKnowledge(applicationId, field, value, env);
+    }
 
-  }
+    await updateStatus(id, "completed", env);
 
-
-  catch (error) {
-
-    console.error(
-      "[PROCESS] ERROR:",
-      error
-    );
-
-
-    // ========================================================
-    // MARK FAILED
-    // ========================================================
+  } catch (error) {
+    console.error("[PROCESS] ERROR:", error);
 
     try {
-
-      await updateStatus(
-        id,
-        "failed",
-        env
-      );
-
+      await updateStatus(id, "failed", env, error.message);
+    } catch (statusError) {
+      console.error("[PROCESS] Failed to update status:", statusError);
     }
-
-    catch (statusError) {
-
-      console.error(
-        "[PROCESS] Failed to update status:",
-        statusError
-      );
-
-    }
-
 
     throw error;
-
   }
-
 }
 
+// ============================================================
+// FETCH FRESH ROW
+// ============================================================
+
+async function fetchBusinessDataRow(id, env) {
+  const url =
+    `${env.SUPABASE_URL}/rest/v1/business_data` +
+    `?id=eq.${encodeURIComponent(id)}` +
+    `&select=id,application_id,field,data,source_url,ai_status` +
+    `&limit=1`;
+
+  const response = await fetch(url, { method: "GET", headers: supabaseHeaders(env) });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Could not fetch fresh business_data row: ${errorText}`);
+  }
+
+  const rows = await response.json();
+  return rows[0] || null;
+}
+
+// ============================================================
+// CALL SARVAM (with retry)
+// ============================================================
+
+async function callSarvamWithRetry(rawText, sourceUrl, env) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= SARVAM_MAX_RETRIES + 1; attempt++) {
+    try {
+      return await callSarvam(rawText, sourceUrl, env);
+    } catch (error) {
+      lastError = error;
+      const retriable = /HTTP (429|500|502|503|504)/.test(error.message);
+
+      if (!retriable || attempt > SARVAM_MAX_RETRIES) break;
+
+      console.log(`[SARVAM] Retriable error, attempt ${attempt}. Retrying...`);
+      await sleep(attempt * 1000);
+    }
+  }
+
+  throw lastError;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ============================================================
 // CALL SARVAM
 // ============================================================
 
-async function callSarvam(
-  rawText,
-  sourceUrl,
-  env
-) {
+// Short, rule-dense prompt. Same constraints as before, far
+// fewer tokens: less input cost, less chance of the model
+// rambling or exceeding output limits.
+const SYSTEM_PROMPT = `Extract real business information from raw website text.
 
-  const systemPrompt = `
-You are a business information extraction AI.
+Rules:
+- Only use facts explicitly present in the text. Never invent or guess.
+- Ignore navigation, menus, footers, templates, placeholders, Lorem Ipsum, and any example/demo contact info.
+- Ignore content clearly belonging to a different business.
+- Skip fields with no supporting text — do not include empty fields.
+- Output ONLY a valid JSON object. No markdown, no explanations.
 
-You receive raw text scraped from a business website.
+Possible fields (use only what's supported, add others if clearly present):
+business_name, business_type, description, services, products, phone, email, address, city, state, country, postal_code, hours, team, owner, pricing, appointments, faqs, social_media, website, contact_information.
 
-Your job is to extract real business information from that text.
+Use arrays for lists (e.g. services), objects for structured data (e.g. address).`;
 
-STRICT RULES:
+async function callSarvam(rawText, sourceUrl, env) {
+  const userPrompt = `SOURCE URL: ${sourceUrl || "Unknown"}\n\nRAW WEBSITE TEXT:\n${rawText}`;
 
-1. Never hallucinate.
-2. Never invent information.
-3. Only use information explicitly supported by the supplied text.
-4. Ignore website navigation.
-5. Ignore menus.
-6. Ignore footer templates.
-7. Ignore generic template content.
-8. Ignore demo information.
-9. Ignore placeholder information.
-10. Ignore Lorem Ipsum.
-11. Ignore fake/example phone numbers.
-12. Ignore fake/example email addresses.
-13. Ignore information that clearly belongs to another business.
-14. Do not guess missing information.
-15. Do not create information that is not present.
-16. Do not include empty fields.
-17. Return ONLY valid JSON.
-18. Do not return Markdown.
-19. Do not return explanations.
+  const response = await fetch(SARVAM_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": env.SARVAM_API_KEY
+    },
+    body: JSON.stringify({
+      model: SARVAM_MODEL,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userPrompt }
+      ],
+      temperature: 0.2,
+      max_tokens: 4096,
+      response_format: { type: "json_object" }
+    })
+  });
 
-Possible fields include:
-
-business_name
-business_type
-description
-about
-services
-products
-phone
-email
-address
-city
-state
-country
-postal_code
-hours
-team
-owner
-doctor
-pricing
-appointments
-faqs
-social_media
-website
-contact_information
-
-For multiple services/products, use arrays.
-
-For structured information, use objects.
-
-Example:
-
-{
-  "business_name": "Example Dental Clinic",
-  "business_type": "Dental Clinic",
-  "services": [
-    "Root Canal Treatment",
-    "Tooth Extraction",
-    "Braces"
-  ],
-  "phone": "+91 79947 43699",
-  "address": {
-    "street": "18/373 Akshaya Complex",
-    "city": "Palakkad",
-    "state": "Kerala",
-    "country": "India"
-  }
-}
-
-Return only information supported by the raw website text.
-`;
-
-
-  const userPrompt = `
-SOURCE URL:
-
-${sourceUrl || "Unknown"}
-
-
-RAW WEBSITE TEXT:
-
-${rawText}
-`;
-
-
-  const response =
-    await fetch(
-      SARVAM_URL,
-      {
-
-        method:
-          "POST",
-
-        headers: {
-
-          "Content-Type":
-            "application/json",
-
-          "api-subscription-key":
-            env.SARVAM_API_KEY
-
-        },
-
-        body:
-          JSON.stringify({
-
-            model:
-              SARVAM_MODEL,
-
-            messages: [
-
-              {
-                role:
-                  "system",
-
-                content:
-                  systemPrompt
-              },
-
-              {
-                role:
-                  "user",
-
-                content:
-                  userPrompt
-              }
-
-            ],
-
-            temperature:
-              0.2,
-
-            max_tokens:
-              4096,
-
-            response_format: {
-              type:
-                "json_object"
-            }
-
-          })
-
-      }
-    );
-
-
-  console.log(
-    "[SARVAM] HTTP status:",
-    response.status
-  );
-
-
-  const responseText =
-    await response.text();
-
+  const responseText = await response.text();
 
   if (!response.ok) {
-
-    console.error(
-      "[SARVAM] API error:",
-      responseText
-    );
-
-
-    throw new Error(
-      `Sarvam API failed with HTTP ${response.status}: ${responseText}`
-    );
-
+    throw new Error(`HTTP ${response.status}: ${responseText}`);
   }
-
 
   let responseJson;
-
-
   try {
-
-    responseJson =
-      JSON.parse(
-        responseText
-      );
-
+    responseJson = JSON.parse(responseText);
+  } catch {
+    throw new Error("Sarvam returned invalid JSON envelope");
   }
 
-  catch {
-
-    console.error(
-      "[SARVAM] Invalid API JSON:",
-      responseText
-    );
-
-
-    throw new Error(
-      "Sarvam returned invalid JSON"
-    );
-
-  }
-
-
-  let content =
-    responseJson
-      ?.choices?.[0]
-      ?.message?.content;
-
-
+  let content = responseJson?.choices?.[0]?.message?.content;
   if (!content) {
-
-    console.error(
-      "[SARVAM] Full response:",
-      responseText
-    );
-
-
-    throw new Error(
-      "Sarvam response does not contain message content"
-    );
-
+    throw new Error("Sarvam response does not contain message content");
   }
 
-
-  // ========================================================
-  // CONTENT MAY ALREADY BE OBJECT
-  // ========================================================
-
-  if (
-    typeof content ===
-    "object"
-  ) {
-
-    return cleanExtractedObject(
-      content
-    );
-
+  if (typeof content === "object") {
+    return cleanExtractedObject(content);
   }
 
-
-  // ========================================================
-  // REMOVE MARKDOWN JSON FENCES
-  // ========================================================
-
-  content =
-    content
-      .replace(
-        /^```json\s*/i,
-        ""
-      )
-      .replace(
-        /^```\s*/i,
-        ""
-      )
-      .replace(
-        /\s*```$/i,
-        ""
-      )
-      .trim();
-
-
-  // ========================================================
-  // PARSE JSON
-  // ========================================================
+  content = content
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
 
   let extracted;
-
-
   try {
-
-    extracted =
-      JSON.parse(
-        content
-      );
-
+    extracted = JSON.parse(content);
+  } catch {
+    console.error("[SARVAM] Model returned invalid JSON:", content);
+    throw new Error("Sarvam returned JSON that could not be parsed");
   }
 
-  catch {
-
-    console.error(
-      "[SARVAM] Model returned invalid JSON:"
-    );
-
-
-    console.error(
-      content
-    );
-
-
-    throw new Error(
-      "Sarvam returned JSON that could not be parsed"
-    );
-
-  }
-
-
-  return cleanExtractedObject(
-    extracted
-  );
-
+  return cleanExtractedObject(extracted);
 }
-
 
 // ============================================================
 // CLEAN SARVAM OUTPUT
 // ============================================================
 
-function cleanExtractedObject(
-  value
-) {
-
-  if (
-    !value ||
-    typeof value !== "object" ||
-    Array.isArray(value)
-  ) {
-
-    throw new Error(
-      "Sarvam returned an invalid extraction object"
-    );
-
+function cleanExtractedObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Sarvam returned an invalid extraction object");
   }
-
 
   const result = {};
 
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    if (!rawKey) continue;
 
-  for (
-    const [
-      rawKey,
-      rawValue
-    ]
-    of Object.entries(
-      value
-    )
-  ) {
+    const field = rawKey.trim().toLowerCase().replace(/\s+/g, "_");
+    if (!field) continue;
 
-    if (!rawKey) {
+    if (rawValue === null || rawValue === undefined || rawValue === "") continue;
 
+    if (Array.isArray(rawValue)) {
+      const cleanedArray = rawValue.filter((item) => item !== null && item !== undefined && item !== "");
+      if (cleanedArray.length === 0) continue;
+      result[field] = cleanedArray;
       continue;
-
     }
 
-
-    const field =
-      rawKey
-        .trim()
-        .toLowerCase()
-        .replace(
-          /\s+/g,
-          "_"
-        );
-
-
-    if (!field) {
-
-      continue;
-
-    }
-
-
-    if (
-      rawValue === null ||
-      rawValue === undefined ||
-      rawValue === ""
-    ) {
-
-      continue;
-
-    }
-
-
-    // --------------------------------------------------------
-    // ARRAYS
-    // --------------------------------------------------------
-
-    if (
-      Array.isArray(
-        rawValue
-      )
-    ) {
-
-      const cleanedArray =
-        rawValue.filter(
-          item =>
-            item !== null &&
-            item !== undefined &&
-            item !== ""
-        );
-
-
-      if (
-        cleanedArray.length === 0
-      ) {
-
-        continue;
-
-      }
-
-
-      result[field] =
-        cleanedArray;
-
-
-      continue;
-
-    }
-
-
-    // --------------------------------------------------------
-    // NORMAL VALUE
-    // --------------------------------------------------------
-
-    result[field] =
-      rawValue;
-
+    result[field] = rawValue;
   }
 
-
   return result;
-
 }
-
 
 // ============================================================
 // SAVE TO business_knowledge
 // ============================================================
 
-async function saveKnowledge(
-  applicationId,
-  field,
-  value,
-  env
-) {
-
-  console.log(
-    `[KNOWLEDGE] Processing field: ${field}`
-  );
-
-
-  // ========================================================
-  // CHECK EXISTING FIELD
-  // ========================================================
-
+async function saveKnowledge(applicationId, field, value, env) {
   const existingUrl =
     `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
     `?application_id=eq.${encodeURIComponent(applicationId)}` +
@@ -1513,403 +379,122 @@ async function saveKnowledge(
     `&select=id,data` +
     `&limit=1`;
 
+  const existingResponse = await fetch(existingUrl, { method: "GET", headers: supabaseHeaders(env) });
 
-  const existingResponse =
-    await fetch(
-      existingUrl,
-      {
-
-        method:
-          "GET",
-
-        headers:
-          supabaseHeaders(env)
-
-      }
-    );
-
-
-  if (
-    !existingResponse.ok
-  ) {
-
-    const errorText =
-      await existingResponse.text();
-
-
-    throw new Error(
-      `Could not check business_knowledge: ${errorText}`
-    );
-
+  if (!existingResponse.ok) {
+    const errorText = await existingResponse.text();
+    throw new Error(`Could not check business_knowledge: ${errorText}`);
   }
 
+  const existingRows = await existingResponse.json();
+  let finalValue = value;
 
-  const existingRows =
-    await existingResponse.json();
-
-
-  let finalValue =
-    value;
-
-
-  // ========================================================
-  // MERGE ARRAYS
-  // ========================================================
-
-  if (
+  if (existingRows.length > 0 && Array.isArray(existingRows[0].data) && Array.isArray(value)) {
+    finalValue = removeDuplicateValues([...existingRows[0].data, ...value]);
+  } else if (
     existingRows.length > 0 &&
-    Array.isArray(
-      existingRows[0].data
-    ) &&
-    Array.isArray(
-      value
-    )
+    isPlainObject(existingRows[0].data) &&
+    isPlainObject(value)
   ) {
-
-    finalValue =
-      removeDuplicateValues(
-        [
-          ...existingRows[0].data,
-          ...value
-        ]
-      );
-
+    finalValue = { ...existingRows[0].data, ...value };
   }
 
+  const upsertUrl = `${env.SUPABASE_URL}/rest/v1/business_knowledge?on_conflict=application_id,field`;
 
-  // ========================================================
-  // MERGE OBJECTS
-  // ========================================================
+  const response = await fetch(upsertUrl, {
+    method: "POST",
+    headers: {
+      ...supabaseHeaders(env),
+      "Prefer": "resolution=merge-duplicates,return=minimal"
+    },
+    body: JSON.stringify({
+      application_id: applicationId,
+      field: field,
+      data: finalValue,
+      updated_at: new Date().toISOString()
+    })
+  });
 
-  else if (
-    existingRows.length > 0 &&
-    isPlainObject(
-      existingRows[0].data
-    ) &&
-    isPlainObject(
-      value
-    )
-  ) {
-
-    finalValue = {
-
-      ...existingRows[0].data,
-
-      ...value
-
-    };
-
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Could not save business_knowledge: ${errorText}`);
   }
-
-
-  // ========================================================
-  // UPSERT
-  // ========================================================
-
-  const upsertUrl =
-    `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
-    `?on_conflict=application_id,field`;
-
-
-  const response =
-    await fetch(
-      upsertUrl,
-      {
-
-        method:
-          "POST",
-
-        headers: {
-
-          ...supabaseHeaders(env),
-
-          "Prefer":
-            "resolution=merge-duplicates,return=minimal"
-
-        },
-
-        body:
-          JSON.stringify({
-
-            application_id:
-              applicationId,
-
-            field:
-              field,
-
-            data:
-              finalValue,
-
-            updated_at:
-              new Date().toISOString()
-
-          })
-
-      }
-    );
-
-
-  if (
-    !response.ok
-  ) {
-
-    const errorText =
-      await response.text();
-
-
-    console.error(
-      "[KNOWLEDGE] Save error:",
-      errorText
-    );
-
-
-    throw new Error(
-      `Could not save business_knowledge: ${errorText}`
-    );
-
-  }
-
-
-  console.log(
-    `[KNOWLEDGE] Saved successfully: ${field}`
-  );
-
 }
-
 
 // ============================================================
 // UPDATE ai_status
 // ============================================================
 
-async function updateStatus(
-  id,
-  status,
-  env
-) {
+async function updateStatus(id, status, env, errorMessage = null) {
+  const url = `${env.SUPABASE_URL}/rest/v1/business_data?id=eq.${encodeURIComponent(id)}`;
 
-  console.log(
-    `[STATUS] Updating ${id} -> ${status}`
-  );
-
-
-  const url =
-    `${env.SUPABASE_URL}/rest/v1/business_data` +
-    `?id=eq.${encodeURIComponent(id)}`;
-
-
-  const response =
-    await fetch(
-      url,
-      {
-
-        method:
-          "PATCH",
-
-        headers: {
-
-          ...supabaseHeaders(env),
-
-          "Prefer":
-            "return=minimal"
-
-        },
-
-        body:
-          JSON.stringify({
-
-            ai_status:
-              status,
-
-            updated_at:
-              new Date().toISOString()
-
-          })
-
-      }
-    );
-
-
-  if (
-    !response.ok
-  ) {
-
-    const errorText =
-      await response.text();
-
-
-    throw new Error(
-      `Could not update ai_status: ${errorText}`
-    );
-
-  }
-
-
-  console.log(
-    `[STATUS] ${id} -> ${status}`
-  );
-
-}
-
-
-// ============================================================
-// SUPABASE HEADERS
-// ============================================================
-
-function supabaseHeaders(
-  env
-) {
-
-  return {
-
-    "apikey":
-      env.SUPABASE_SERVICE_ROLE_KEY,
-
-    "Authorization":
-      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-
-    "Content-Type":
-      "application/json"
-
+  const body = {
+    ai_status: status,
+    updated_at: new Date().toISOString()
   };
 
+  if (errorMessage) {
+    body.ai_error = errorMessage.slice(0, 2000);
+  }
+
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { ...supabaseHeaders(env), "Prefer": "return=minimal" },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Could not update ai_status: ${errorText}`);
+  }
 }
 
-
 // ============================================================
-// REMOVE DUPLICATES
+// HELPERS
 // ============================================================
 
-function removeDuplicateValues(
-  array
-) {
+function supabaseHeaders(env) {
+  return {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json"
+  };
+}
 
-  const seen =
-    new Set();
-
+function removeDuplicateValues(array) {
+  const seen = new Set();
   const result = [];
 
+  for (const item of array) {
+    const key =
+      item !== null && typeof item === "object"
+        ? JSON.stringify(item)
+        : String(item).trim().toLowerCase();
 
-  for (
-    const item
-    of array
-  ) {
-
-    let key;
-
-
-    if (
-      item !== null &&
-      typeof item === "object"
-    ) {
-
-      key =
-        JSON.stringify(
-          item
-        );
-
-    }
-
-    else {
-
-      key =
-        String(item)
-          .trim()
-          .toLowerCase();
-
-    }
-
-
-    if (
-      !seen.has(key)
-    ) {
-
+    if (!seen.has(key)) {
       seen.add(key);
-
-      result.push(
-        item
-      );
-
+      result.push(item);
     }
-
   }
 
-
   return result;
-
 }
 
-
-// ============================================================
-// OBJECT CHECK
-// ============================================================
-
-function isPlainObject(
-  value
-) {
-
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value)
-  );
-
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-
-// ============================================================
-// JSON RESPONSE
-// ============================================================
-
-function jsonResponse(
-  data,
-  status = 200
-) {
-
-  return new Response(
-
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
-
-    {
-
-      status,
-
-      headers: {
-
-        ...corsHeaders(),
-
-        "Content-Type":
-          "application/json"
-
-      }
-
-    }
-
-  );
-
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { ...corsHeaders(), "Content-Type": "application/json" }
+  });
 }
-
-
-// ============================================================
-// CORS
-// ============================================================
 
 function corsHeaders() {
-
   return {
-
-    "Access-Control-Allow-Origin":
-      "*",
-
-    "Access-Control-Allow-Methods":
-      "GET, POST, OPTIONS",
-
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization"
-
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
   };
-
-    }
+}
