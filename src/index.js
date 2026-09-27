@@ -12,7 +12,7 @@
 //       ↓
 // Read business_data
 //       ↓
-// Sarvam AI
+// Sarvam 
 //       ↓
 // Deduplicate fields
 //       ↓
