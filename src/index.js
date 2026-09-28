@@ -1,17 +1,36 @@
-const SARVAM_URL =
-  "https://api.sarvam.ai/v1/chat/completions";
-
-const SARVAM_MODEL = "sarvam-105b";
+/**
+ * Reportli AI — Business Knowledge Worker
+ *
+ * Flow:
+ * business_data INSERT
+ *       ↓
+ * Supabase Webhook
+ *       ↓
+ * Cloudflare Worker
+ *       ↓
+ * Fetch fresh business_data row
+ *       ↓
+ * Sarvam AI
+ *       ↓
+ * Merge into business_knowledge
+ *       ↓
+ * ai_status = completed
+ *
+ * Required Worker secrets:
+ * SUPABASE_URL
+ * SUPABASE_SERVICE_ROLE_KEY
+ * SARVAM_API_KEY
+ */
 
 const MAX_TEXT_CHARS = 40000;
 const SARVAM_MAX_RETRIES = 2;
+const SARVAM_MODEL = "sarvam-105b";
 
 export default {
   async fetch(request, env, ctx) {
-
-    // -----------------------------
+    // --------------------------------------------------
     // CORS
-    // -----------------------------
+    // --------------------------------------------------
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -20,24 +39,23 @@ export default {
       });
     }
 
-    // -----------------------------
+    // --------------------------------------------------
     // Health check
-    // -----------------------------
+    // --------------------------------------------------
 
     if (request.method === "GET") {
-      return json({
+      return jsonResponse({
         ok: true,
-        service: "ai-business-knowledge-worker",
-        status: "running"
+        service: "reportli-business-knowledge-worker"
       });
     }
 
-    // -----------------------------
-    // POST only
-    // -----------------------------
+    // --------------------------------------------------
+    // Webhook only accepts POST
+    // --------------------------------------------------
 
     if (request.method !== "POST") {
-      return json(
+      return jsonResponse(
         {
           ok: false,
           error: "Method not allowed"
@@ -46,16 +64,16 @@ export default {
       );
     }
 
-    // -----------------------------
-    // Read webhook
-    // -----------------------------
+    // --------------------------------------------------
+    // Read webhook body
+    // --------------------------------------------------
 
     let payload;
 
     try {
       payload = await request.json();
     } catch {
-      return json(
+      return jsonResponse(
         {
           ok: false,
           error: "Invalid JSON"
@@ -65,38 +83,32 @@ export default {
     }
 
     console.log(
-      "Webhook:",
+      "Webhook received:",
       JSON.stringify(payload)
     );
 
-    // -----------------------------
-    // Supabase sends the row
-    // directly at the root.
-    //
-    // Also support wrapped payloads.
-    // -----------------------------
+    // --------------------------------------------------
+    // Supabase can send the row directly at root level.
+    // Also support common wrapped formats.
+    // --------------------------------------------------
 
     const record =
       (
         payload?.id &&
         payload?.application_id &&
-        payload?.field
-      )
-        ? payload
-        : (
-            payload?.record ||
-            payload?.new_record ||
-            payload?.data?.record ||
-            payload?.data?.new_record ||
-            null
-          );
+        payload?.field &&
+        payload
+      ) ||
+      payload?.record ||
+      payload?.new_record ||
+      payload?.data?.record ||
+      payload?.data?.new_record ||
+      null;
 
     if (!record) {
-      console.error(
-        "BUSINESS_DATA_RECORD_NOT_FOUND"
-      );
+      console.error("Could not find business_data record");
 
-      return json(
+      return jsonResponse(
         {
           ok: false,
           error: "BUSINESS_DATA_RECORD_NOT_FOUND"
@@ -105,63 +117,87 @@ export default {
       );
     }
 
-    // -----------------------------
-    // Only page records
-    // -----------------------------
+    // --------------------------------------------------
+    // Only process INSERT events
+    // --------------------------------------------------
 
-    if (record.field !== "page") {
-      return json({
+    const eventType =
+      payload?.type ||
+      payload?.event ||
+      payload?.event_type ||
+      "INSERT";
+
+    if (eventType !== "INSERT") {
+      return jsonResponse({
         ok: true,
         skipped: true,
-        reason: "Only page records are processed"
+        reason: `Event type ${eventType} ignored`
       });
     }
 
-    // -----------------------------
-    // Process asynchronously
-    // -----------------------------
+    // --------------------------------------------------
+    // Only process page records
+    // --------------------------------------------------
+
+    if (record.field !== "page") {
+      return jsonResponse({
+        ok: true,
+        skipped: true,
+        reason: "Only field=page is processed"
+      });
+    }
+
+    const rowId = record.id;
+
+    if (!rowId) {
+      return jsonResponse(
+        {
+          ok: false,
+          error: "Missing business_data id"
+        },
+        400
+      );
+    }
+
+    // --------------------------------------------------
+    // Process in background
+    // --------------------------------------------------
 
     ctx.waitUntil(
-      processRecord(
-        record.id,
-        env
-      )
+      processBusinessData(rowId, env).catch((error) => {
+        console.error(
+          "Background processing failed:",
+          error
+        );
+      })
     );
 
-    // -----------------------------
-    // Respond immediately
-    // -----------------------------
+    // --------------------------------------------------
+    // Respond immediately to Supabase
+    // --------------------------------------------------
 
-    return json({
+    return jsonResponse({
       ok: true,
       received: true,
-      id: record.id
+      id: rowId
     });
   }
 };
 
 
-// =====================================================
-// PROCESS RECORD
-// =====================================================
+// ======================================================
+// MAIN PROCESSOR
+// ======================================================
 
-async function processRecord(id, env) {
-
-  console.log(
-    `Processing ${id}`
-  );
+async function processBusinessData(id, env) {
+  console.log(`Starting processing: ${id}`);
 
   try {
+    // --------------------------------------------------
+    // Fetch the latest row from Supabase
+    // --------------------------------------------------
 
-    // -----------------------------
-    // Fetch fresh row
-    // -----------------------------
-
-    const row =
-      await getBusinessData(
-        id,
-        env
-      );
+    const row = await getBusinessData(id, env);
 
     if (!row) {
       throw new Error(
@@ -169,88 +205,93 @@ async function processRecord(id, env) {
       );
     }
 
-    // -----------------------------
-    // Only pending rows
-    // -----------------------------
+    // --------------------------------------------------
+    // Only process page
+    // --------------------------------------------------
+
+    if (row.field !== "page") {
+      console.log(
+        `Skipping ${id}: field=${row.field}`
+      );
+
+      return;
+    }
+
+    // --------------------------------------------------
+    // Only process pending rows
+    // --------------------------------------------------
 
     if (
       row.ai_status !== "pending" &&
       row.ai_status !== null
     ) {
       console.log(
-        `Skipping ${id}. Status: ${row.ai_status}`
+        `Skipping ${id}: ai_status=${row.ai_status}`
       );
 
       return;
     }
 
-    // -----------------------------
-    // Claim row
-    // -----------------------------
+    // --------------------------------------------------
+    // Claim the row
+    // --------------------------------------------------
 
-    const claimed =
-      await claimRow(
-        id,
-        env
-      );
+    const claimed = await claimRow(id, env);
 
     if (!claimed) {
       console.log(
-        `Row ${id} already claimed`
+        `Row ${id} was already claimed`
       );
 
       return;
     }
 
-    // -----------------------------
-    // Validate data
-    // -----------------------------
+    // --------------------------------------------------
+    // Get page data
+    // --------------------------------------------------
 
-    if (!row.data) {
+    const pageData = row.data;
+
+    if (!pageData) {
       throw new Error(
         "business_data.data is empty"
       );
     }
 
-    // -----------------------------
-    // Prepare AI input
-    // -----------------------------
+    // --------------------------------------------------
+    // Convert data to text
+    // --------------------------------------------------
 
-    const input =
-      JSON.stringify(
-        row.data,
-        null,
-        2
-      ).slice(
-        0,
-        MAX_TEXT_CHARS
-      );
+    const inputText = JSON.stringify(
+      pageData,
+      null,
+      2
+    ).slice(0, MAX_TEXT_CHARS);
 
-    // -----------------------------
-    // Sarvam
-    // -----------------------------
+    console.log(
+      `Sending ${inputText.length} characters to Sarvam`
+    );
+
+    // --------------------------------------------------
+    // Ask Sarvam
+    // --------------------------------------------------
 
     const knowledge =
       await extractKnowledge(
-        input,
+        inputText,
         env
       );
 
-    console.log(
-      `Extracted ${knowledge.length} fields`
-    );
-
-    // -----------------------------
-    // Save knowledge
-    // -----------------------------
+    // --------------------------------------------------
+    // Save extracted knowledge
+    // --------------------------------------------------
 
     for (const item of knowledge) {
-
-      if (!item) continue;
-
-      if (!item.field) continue;
-
-      if (item.data === undefined) {
+      if (
+        !item ||
+        !item.field ||
+        item.data === undefined
+      ) {
         continue;
       }
 
@@ -263,41 +304,42 @@ async function processRecord(id, env) {
       );
     }
 
-    // -----------------------------
-    // SUCCESS
-    // -----------------------------
+    // --------------------------------------------------
+    // Mark completed
+    // --------------------------------------------------
 
     await updateStatus(
       id,
       "completed",
-      env
+      env,
+      null
     );
 
     console.log(
-      `Completed ${id}`
+      `Completed successfully: ${id}`
     );
 
   } catch (error) {
 
     console.error(
-      `Failed ${id}:`,
+      `Processing failed for ${id}:`,
       error
     );
 
-    try {
+    // --------------------------------------------------
+    // Save error
+    // --------------------------------------------------
 
+    try {
       await updateStatus(
         id,
         "failed",
         env,
-        error?.message ||
-          String(error)
+        error?.message || String(error)
       );
-
     } catch (statusError) {
-
       console.error(
-        "Failed to save error:",
+        "Could not save failure status:",
         statusError
       );
     }
@@ -305,117 +347,90 @@ async function processRecord(id, env) {
 }
 
 
-// =====================================================
+// ======================================================
 // GET BUSINESS DATA
-// =====================================================
+// ======================================================
 
-async function getBusinessData(
-  id,
-  env
-) {
-
+async function getBusinessData(id, env) {
   const url =
-    `${env.SUPABASE_URL}` +
-    `/rest/v1/business_data` +
+    `${env.SUPABASE_URL}/rest/v1/business_data` +
     `?id=eq.${encodeURIComponent(id)}` +
     `&select=id,application_id,field,data,source_url,ai_status` +
     `&limit=1`;
 
-  const response =
-    await fetch(
-      url,
-      {
-        headers:
-          supabaseHeaders(env)
-      }
-    );
+  const response = await fetch(url, {
+    method: "GET",
+    headers: supabaseHeaders(env)
+  });
 
   if (!response.ok) {
-
-    const text =
-      await response.text();
+    const text = await response.text();
 
     throw new Error(
-      `Supabase GET failed: ${response.status} ${text}`
+      `Supabase GET business_data failed: ${response.status} ${text}`
     );
   }
 
-  const rows =
-    await response.json();
+  const rows = await response.json();
 
   return rows?.[0] || null;
 }
 
 
-// =====================================================
-// CLAIM PENDING ROW
-// =====================================================
+// ======================================================
+// CLAIM ROW
+// ======================================================
 
-async function claimRow(
-  id,
-  env
-) {
-
+async function claimRow(id, env) {
   const url =
-    `${env.SUPABASE_URL}` +
-    `/rest/v1/business_data` +
+    `${env.SUPABASE_URL}/rest/v1/business_data` +
     `?id=eq.${encodeURIComponent(id)}` +
     `&ai_status=eq.pending`;
 
-  const response =
-    await fetch(
-      url,
-      {
-        method: "PATCH",
+  const response = await fetch(url, {
+    method: "PATCH",
 
-        headers: {
-          ...supabaseHeaders(env),
-          "Prefer":
-            "return=representation"
-        },
+    headers: {
+      ...supabaseHeaders(env),
+      "Prefer": "return=representation"
+    },
 
-        body: JSON.stringify({
-          ai_status: "processing",
-          ai_error: null,
-          updated_at:
-            new Date().toISOString()
-        })
-      }
-    );
+    body: JSON.stringify({
+      ai_status: "processing",
+      ai_error: null,
+      updated_at: new Date().toISOString()
+    })
+  });
 
   if (!response.ok) {
-
-    const text =
-      await response.text();
+    const text = await response.text();
 
     throw new Error(
-      `Claim failed: ${response.status} ${text}`
+      `Could not claim business_data row: ${response.status} ${text}`
     );
   }
 
-  const rows =
-    await response.json();
+  const rows = await response.json();
 
-  return (
-    Array.isArray(rows) &&
-    rows.length > 0
-  );
+  return Array.isArray(rows) && rows.length > 0;
 }
 
 
-// =====================================================
-// SARVAM
-// =====================================================
+// ======================================================
+// SARVAM AI
+// ======================================================
 
 async function extractKnowledge(
-  input,
+  inputText,
   env
 ) {
+  const url =
+    "https://api.sarvam.ai/v1/chat/completions";
 
   const prompt = `
-Extract useful business facts from this webpage data.
+Extract useful business knowledge from this webpage data.
 
-Return ONLY JSON:
+Return ONLY valid JSON:
 {
   "knowledge": [
     {
@@ -425,76 +440,60 @@ Return ONLY JSON:
   ]
 }
 
-Extract business name, description, phone, email, address, hours, services, products, prices, policies and FAQs.
+Keep only useful facts such as business name, description, phone, email, address, hours, services, products, pricing, policies, and FAQs.
 
-Do not invent facts.
+Do not invent information.
 
 WEBPAGE DATA:
-${input}
+${inputText}
 `;
 
-  let lastError;
+  let lastError = null;
 
   for (
     let attempt = 0;
     attempt <= SARVAM_MAX_RETRIES;
     attempt++
   ) {
-
     try {
-
       console.log(
         `Sarvam attempt ${attempt + 1}`
       );
 
-      const response =
-        await fetch(
-          SARVAM_URL,
-          {
-            method: "POST",
+      const response = await fetch(url, {
+        method: "POST",
 
-            headers: {
-              "Content-Type":
-                "application/json",
+        headers: {
+          "Content-Type": "application/json",
+          "api-subscription-key":
+            env.SARVAM_API_KEY
+        },
 
-              "api-subscription-key":
-                env.SARVAM_API_KEY
-            },
+        body: JSON.stringify({
+          model: SARVAM_MODEL,
 
-            body: JSON.stringify({
-              model: SARVAM_MODEL,
+          messages: [
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
 
-              messages: [
-                {
-                  role: "user",
-                  content: prompt
-                }
-              ],
+          temperature: 0
+        })
+      });
 
-              temperature: 0
-            })
-          }
-        );
-
-      const text =
+      const responseText =
         await response.text();
 
       if (!response.ok) {
-
         throw new Error(
-          `Sarvam ${response.status}: ${text}`
+          `Sarvam API ${response.status}: ${responseText}`
         );
       }
 
-      let result;
-
-      try {
-        result = JSON.parse(text);
-      } catch {
-        throw new Error(
-          `Invalid Sarvam response: ${text}`
-        );
-      }
+      const result =
+        JSON.parse(responseText);
 
       const content =
         result?.choices?.[0]?.message?.content;
@@ -506,33 +505,31 @@ ${input}
       }
 
       const parsed =
-        parseAIJSON(content);
+        parseSarvamJSON(content);
 
       if (
         !parsed ||
-        !Array.isArray(
-          parsed.knowledge
-        )
+        !Array.isArray(parsed.knowledge)
       ) {
         throw new Error(
-          "Invalid knowledge format"
+          "Invalid Sarvam response format"
         );
       }
 
       return parsed.knowledge;
 
     } catch (error) {
-
       lastError = error;
 
       console.error(
-        `Sarvam attempt ${attempt + 1} failed`,
+        `Sarvam attempt ${attempt + 1} failed:`,
         error
       );
 
       if (
         attempt < SARVAM_MAX_RETRIES
       ) {
+        // Small retry delay
         await sleep(
           1000 * (attempt + 1)
         );
@@ -540,297 +537,256 @@ ${input}
     }
   }
 
-  throw (
-    lastError ||
-    new Error(
-      "Sarvam extraction failed"
-    )
-  );
+  throw lastError ||
+    new Error("Sarvam extraction failed");
 }
 
 
-// =====================================================
-// PARSE AI JSON
-// =====================================================
+// ======================================================
+// PARSE SARVAM JSON
+// ======================================================
 
-function parseAIJSON(content) {
+function parseSarvamJSON(content) {
+  let text = content.trim();
 
-  let text =
-    String(content).trim();
+  // Remove markdown code fences
+  text = text
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
 
-  text =
-    text
-      .replace(
-        /^```json\s*/i,
-        ""
-      )
-      .replace(
-        /^```\s*/i,
-        ""
-      )
-      .replace(
-        /\s*```$/i,
-        ""
-      )
-      .trim();
-
+  // First attempt
   try {
     return JSON.parse(text);
   } catch {}
 
-  const start =
-    text.indexOf("{");
-
-  const end =
-    text.lastIndexOf("}");
+  // Try extracting first JSON object
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
 
   if (
     start !== -1 &&
     end !== -1 &&
     end > start
   ) {
+    const jsonText =
+      text.slice(start, end + 1);
 
-    return JSON.parse(
-      text.slice(
-        start,
-        end + 1
-      )
-    );
+    return JSON.parse(jsonText);
   }
 
   throw new Error(
-    "Could not parse AI JSON"
+    "Could not parse Sarvam JSON"
   );
 }
 
 
-// =====================================================
-// SAVE BUSINESS KNOWLEDGE
-// =====================================================
+// ======================================================
+// SAVE / MERGE BUSINESS KNOWLEDGE
+// ======================================================
 
 async function saveKnowledge(
   applicationId,
   field,
-  newData,
+  newValue,
   sourceUrl,
   env
 ) {
+  // --------------------------------------------------
+  // Get existing knowledge
+  // --------------------------------------------------
 
-  // -----------------------------
-  // Existing knowledge
-  // -----------------------------
-
-  const lookupUrl =
-    `${env.SUPABASE_URL}` +
-    `/rest/v1/business_knowledge` +
+  const existingUrl =
+    `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
     `?application_id=eq.${encodeURIComponent(applicationId)}` +
     `&field=eq.${encodeURIComponent(field)}` +
     `&select=id,data,source_urls` +
     `&limit=1`;
 
-  const lookup =
-    await fetch(
-      lookupUrl,
-      {
-        headers:
-          supabaseHeaders(env)
-      }
-    );
+  const existingResponse =
+    await fetch(existingUrl, {
+      method: "GET",
+      headers: supabaseHeaders(env)
+    });
 
-  if (!lookup.ok) {
-
+  if (!existingResponse.ok) {
     const text =
-      await lookup.text();
+      await existingResponse.text();
 
     throw new Error(
-      `Knowledge lookup failed: ${lookup.status} ${text}`
+      `Failed to get existing knowledge: ${existingResponse.status} ${text}`
     );
   }
 
-  const rows =
-    await lookup.json();
+  const existingRows =
+    await existingResponse.json();
 
   const existing =
-    rows?.[0] || null;
+    existingRows?.[0] || null;
 
-  // -----------------------------
+  // --------------------------------------------------
   // Merge data
-  // -----------------------------
+  // --------------------------------------------------
 
-  const mergedData =
-    existing?.data !== undefined
-      ? mergeValues(
-          existing.data,
-          newData
-        )
-      : newData;
+  let mergedData = newValue;
 
-  // -----------------------------
-  // Merge URLs
-  // -----------------------------
+  if (existing?.data !== undefined) {
+    mergedData = mergeValues(
+      existing.data,
+      newValue
+    );
+  }
 
-  const oldUrls =
-    Array.isArray(
-      existing?.source_urls
-    )
+  // --------------------------------------------------
+  // Merge source URLs
+  // --------------------------------------------------
+
+  const existingSources =
+    Array.isArray(existing?.source_urls)
       ? existing.source_urls
       : [];
 
-  const sourceUrls =
-    [
-      ...new Set(
-        [
-          ...oldUrls,
-          ...(sourceUrl
-            ? [sourceUrl]
-            : [])
-        ].filter(Boolean)
-      )
-    ];
+  const sourceUrls = [
+    ...new Set(
+      [
+        ...existingSources,
+        ...(sourceUrl ? [sourceUrl] : [])
+      ].filter(Boolean)
+    )
+  ];
 
-  // -----------------------------
-  // Upsert
-  // -----------------------------
+  // --------------------------------------------------
+  // Save
+  // --------------------------------------------------
 
   const url =
-    `${env.SUPABASE_URL}` +
-    `/rest/v1/business_knowledge` +
+    `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
     `?on_conflict=application_id,field`;
 
-  const response =
-    await fetch(
-      url,
+  const response = await fetch(url, {
+    method: "POST",
+
+    headers: {
+      ...supabaseHeaders(env),
+      "Prefer": "resolution=merge-duplicates,return=minimal"
+    },
+
+    body: JSON.stringify([
       {
-        method: "POST",
-
-        headers: {
-          ...supabaseHeaders(env),
-
-          "Prefer":
-            "resolution=merge-duplicates,return=minimal"
-        },
-
-        body: JSON.stringify([
-          {
-            application_id:
-              applicationId,
-
-            field,
-
-            data:
-              mergedData,
-
-            source_urls:
-              sourceUrls,
-
-            updated_at:
-              new Date().toISOString()
-          }
-        ])
+        application_id: applicationId,
+        field,
+        data: mergedData,
+        source_urls: sourceUrls,
+        updated_at:
+          new Date().toISOString()
       }
-    );
+    ])
+  });
 
   if (!response.ok) {
-
     const text =
       await response.text();
 
     throw new Error(
-      `Knowledge save failed: ${response.status} ${text}`
+      `Failed to save business knowledge: ${response.status} ${text}`
     );
   }
+
+  console.log(
+    `Saved knowledge: ${applicationId} / ${field}`
+  );
 }
 
 
-// =====================================================
-// MERGE DATA
-// =====================================================
+// ======================================================
+// MERGE VALUES
+// ======================================================
 
 function mergeValues(
   oldValue,
   newValue
 ) {
-
+  // --------------------------------------------------
   // Arrays
+  // --------------------------------------------------
 
   if (
     Array.isArray(oldValue) &&
     Array.isArray(newValue)
   ) {
-
-    return unique([
+    const combined = [
       ...oldValue,
       ...newValue
-    ]);
+    ];
+
+    return removeDuplicates(
+      combined
+    );
   }
 
+  // --------------------------------------------------
   // Objects
+  // --------------------------------------------------
 
   if (
     isObject(oldValue) &&
     isObject(newValue)
   ) {
-
     return {
       ...oldValue,
       ...newValue
     };
   }
 
-  // Same value
+  // --------------------------------------------------
+  // If values are different types,
+  // preserve both.
+  // --------------------------------------------------
 
   if (
-    JSON.stringify(oldValue) ===
+    JSON.stringify(oldValue) !==
     JSON.stringify(newValue)
   ) {
-    return oldValue;
+    return removeDuplicates([
+      oldValue,
+      newValue
+    ]);
   }
 
-  // Different values
-
-  return unique([
-    oldValue,
-    newValue
-  ]);
+  return oldValue;
 }
 
 
-// =====================================================
-// UNIQUE
-// =====================================================
+// ======================================================
+// REMOVE DUPLICATES
+// ======================================================
 
-function unique(values) {
+function removeDuplicates(array) {
+  const seen = new Set();
+  const result = [];
 
-  const seen =
-    new Set();
-
-  const output =
-    [];
-
-  for (const value of values) {
-
+  for (const item of array) {
     const key =
-      typeof value === "object"
-        ? JSON.stringify(value)
-        : String(value);
+      typeof item === "object"
+        ? JSON.stringify(item)
+        : String(item);
 
     if (!seen.has(key)) {
-
       seen.add(key);
-      output.push(value);
+      result.push(item);
     }
   }
 
-  return output;
+  return result;
 }
 
 
-// =====================================================
+// ======================================================
 // OBJECT CHECK
-// =====================================================
+// ======================================================
 
 function isObject(value) {
-
   return (
     value !== null &&
     typeof value === "object" &&
@@ -839,20 +795,18 @@ function isObject(value) {
 }
 
 
-// =====================================================
-// UPDATE STATUS
-// =====================================================
+// ======================================================
+// UPDATE BUSINESS DATA STATUS
+// ======================================================
 
 async function updateStatus(
   id,
   status,
   env,
-  errorMessage = null
+  errorMessage
 ) {
-
   const url =
-    `${env.SUPABASE_URL}` +
-    `/rest/v1/business_data` +
+    `${env.SUPABASE_URL}/rest/v1/business_data` +
     `?id=eq.${encodeURIComponent(id)}`;
 
   const body = {
@@ -861,53 +815,47 @@ async function updateStatus(
       new Date().toISOString()
   };
 
+  // Clear old error when successful
   if (status === "completed") {
     body.ai_error = null;
   }
 
+  // Save error when failed
   if (status === "failed") {
     body.ai_error =
       String(
         errorMessage ||
-        "Unknown error"
+        "Unknown processing error"
       ).slice(0, 2000);
   }
 
-  const response =
-    await fetch(
-      url,
-      {
-        method: "PATCH",
+  const response = await fetch(url, {
+    method: "PATCH",
 
-        headers: {
-          ...supabaseHeaders(env),
-          "Prefer":
-            "return=minimal"
-        },
+    headers: {
+      ...supabaseHeaders(env),
+      "Prefer": "return=minimal"
+    },
 
-        body:
-          JSON.stringify(body)
-      }
-    );
+    body: JSON.stringify(body)
+  });
 
   if (!response.ok) {
-
     const text =
       await response.text();
 
     throw new Error(
-      `Status update failed: ${response.status} ${text}`
+      `Failed to update status: ${response.status} ${text}`
     );
   }
 }
 
 
-// =====================================================
+// ======================================================
 // SUPABASE HEADERS
-// =====================================================
+// ======================================================
 
 function supabaseHeaders(env) {
-
   return {
     "apikey":
       env.SUPABASE_SERVICE_ROLE_KEY,
@@ -921,15 +869,14 @@ function supabaseHeaders(env) {
 }
 
 
-// =====================================================
-// RESPONSE
-// =====================================================
+// ======================================================
+// JSON RESPONSE
+// ======================================================
 
-function json(
+function jsonResponse(
   data,
   status = 200
 ) {
-
   return new Response(
     JSON.stringify(data),
     {
@@ -945,12 +892,11 @@ function json(
 }
 
 
-// =====================================================
-// CORS
-// =====================================================
+// ======================================================
+// CORS HEADERS
+// ======================================================
 
 function corsHeaders() {
-
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods":
@@ -961,17 +907,12 @@ function corsHeaders() {
 }
 
 
-// =====================================================
+// ======================================================
 // SLEEP
-// =====================================================
+// ======================================================
 
 function sleep(ms) {
-
   return new Promise(
-    resolve =>
-      setTimeout(
-        resolve,
-        ms
-      )
+    resolve => setTimeout(resolve, ms)
   );
         }
