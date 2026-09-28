@@ -5,13 +5,13 @@
  *
  * 1. Supabase inserts into business_data
  * 2. Supabase Database Webhook calls this Worker
- * 3. Webhook ONLY validates/queues the row
+ * 3. Webhook only accepts the event
  * 4. Webhook returns immediately
- * 5. Cloudflare Cron runs every 2 minutes
+ * 5. Cloudflare Cron runs periodically
  * 6. Cron finds pending business_data rows
  * 7. Cron claims one row
- * 8. Worker sends webpage data to Sarvam
- * 9. Worker saves extracted knowledge to business_knowledge
+ * 8. Worker sends data to Sarvam
+ * 9. Worker saves knowledge to business_knowledge
  * 10. Worker marks business_data as completed
  *
  * REQUIRED SECRETS
@@ -20,9 +20,8 @@
  * SUPABASE_SERVICE_ROLE_KEY
  * SARVAM_API_KEY
  *
- * REQUIRED CRON
- *
- * */2 * * * *
+ * Configure the Cron expression in Cloudflare:
+ * Every 2 minutes
  */
 
 const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
