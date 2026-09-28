@@ -5,24 +5,20 @@
  *
  * business_data INSERT
  *   -> Supabase Database Webhook
- *   -> Worker (responds immediately, processes in background)
- *   -> fetch fresh row -> claim (pending -> processing)
- *   -> Sarvam AI (time-bounded)
- *   -> save to business_knowledge
+ *   -> Worker
+ *   -> fetch fresh row
+ *   -> claim
+ *   -> Sarvam AI
+ *   -> business_knowledge
  *   -> ai_status = completed
  *
- * Recovery:
- *   - If the web path runs out of time (Cloudflare kills background
- *     work ~30s after the response), the row is put back to "pending".
- *   - A cron trigger (scheduled handler) picks up pending rows and
- *     rows stuck in "processing" for > 4 minutes, and retries them
- *     with a much larger time budget.
- *
  * Required secrets:
- *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SARVAM_API_KEY
+ *   SUPABASE_URL
+ *   SUPABASE_SERVICE_ROLE_KEY
+ *   SARVAM_API_KEY
  *
- * Required trigger (Worker -> Settings -> Triggers -> Cron):
- *   */2 * * * *
+ * Required Cron trigger:
+ *   Every 2 minutes
  */
 
 const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
