@@ -22,16 +22,16 @@
 
 export default {
   async fetch(request, env) {
-    // ---------------------------------------------------------
-    // 1. Basic HTTP handling
-    // ---------------------------------------------------------
+    // =========================================================
+    // 1. HTTP METHOD
+    // =========================================================
 
     if (request.method === "GET") {
       return jsonResponse({
         success: true,
         worker: "ai-business-knowledge-worker",
-        mode: "webhook",
         ai: false,
+        mode: "webhook",
         message: "Business Knowledge Worker is running"
       });
     }
@@ -46,9 +46,9 @@ export default {
       );
     }
 
-    // ---------------------------------------------------------
-    // 2. Parse webhook body
-    // ---------------------------------------------------------
+    // =========================================================
+    // 2. READ WEBHOOK BODY
+    // =========================================================
 
     let payload;
 
@@ -64,21 +64,22 @@ export default {
       );
     }
 
-    console.log("Received webhook:", JSON.stringify(payload));
+    console.log(
+      "Received webhook:",
+      JSON.stringify(payload)
+    );
 
-    // ---------------------------------------------------------
-    // 3. Extract business_data record
-    // ---------------------------------------------------------
+    // =========================================================
+    // 3. FIND business_data RECORD
+    // =========================================================
 
     const record = getBusinessDataRecord(payload);
 
     if (!record) {
-      console.error("Could not find business_data record");
-
       return jsonResponse(
         {
           success: false,
-          error: "Could not find business_data record in webhook payload"
+          error: "Could not find business_data record"
         },
         400
       );
@@ -108,9 +109,9 @@ export default {
       );
     }
 
-    // ---------------------------------------------------------
-    // 4. Mark source row as processing
-    // ---------------------------------------------------------
+    // =========================================================
+    // 4. MARK AS PROCESSING
+    // =========================================================
 
     await updateBusinessDataStatus(
       env,
@@ -120,9 +121,9 @@ export default {
     );
 
     try {
-      // -------------------------------------------------------
-      // 5. Extract raw page data
-      // -------------------------------------------------------
+      // =======================================================
+      // 5. GET RAW DATA
+      // =======================================================
 
       const rawData = record.data;
 
@@ -131,28 +132,31 @@ export default {
         rawData === undefined ||
         rawData === ""
       ) {
-        throw new Error("business_data.data is empty");
+        throw new Error(
+          "business_data.data is empty"
+        );
       }
 
-      // -------------------------------------------------------
-      // 6. Generic extraction
-      // -------------------------------------------------------
+      // =======================================================
+      // 6. EXTRACT KNOWLEDGE
+      // =======================================================
 
-      const extracted = extractKnowledge(rawData);
+      const extracted =
+        extractKnowledge(rawData);
 
       console.log(
-        "Extracted knowledge:",
+        "Extracted:",
         JSON.stringify(extracted)
       );
 
-      // -------------------------------------------------------
-      // 7. Save extracted knowledge
-      // -------------------------------------------------------
+      // =======================================================
+      // 7. SAVE KNOWLEDGE
+      // =======================================================
 
       let savedCount = 0;
 
       for (const item of extracted) {
-        if (!item.field) {
+        if (!item || !item.field) {
           continue;
         }
 
@@ -175,9 +179,9 @@ export default {
         savedCount++;
       }
 
-      // -------------------------------------------------------
-      // 8. Mark source row as completed
-      // -------------------------------------------------------
+      // =======================================================
+      // 8. MARK AS COMPLETED
+      // =======================================================
 
       await updateBusinessDataStatus(
         env,
@@ -187,7 +191,7 @@ export default {
       );
 
       console.log(
-        `Completed application ${applicationId}. Saved ${savedCount} knowledge fields.`
+        `Completed ${applicationId}. Saved ${savedCount} fields.`
       );
 
       return jsonResponse({
@@ -198,7 +202,10 @@ export default {
         fields_saved: savedCount
       });
     } catch (error) {
-      console.error("Knowledge extraction failed:", error);
+      console.error(
+        "Knowledge extraction failed:",
+        error
+      );
 
       await updateBusinessDataStatus(
         env,
@@ -226,7 +233,7 @@ export default {
 
 function getBusinessDataRecord(payload) {
   /*
-   * Supabase Database Webhook normally sends:
+   * Normal Supabase Database Webhook:
    *
    * {
    *   id,
@@ -236,19 +243,21 @@ function getBusinessDataRecord(payload) {
    *   source_url,
    *   ...
    * }
-   *
-   * We also support common wrapped formats.
    */
 
   if (
     payload &&
     payload.id &&
     payload.application_id &&
-    Object.prototype.hasOwnProperty.call(payload, "data")
+    Object.prototype.hasOwnProperty.call(
+      payload,
+      "data"
+    )
   ) {
     return payload;
   }
 
+  // Wrapped formats
   if (payload?.record) {
     return payload.record;
   }
@@ -270,44 +279,41 @@ function getBusinessDataRecord(payload) {
 
 
 // =============================================================
-// MAIN GENERIC EXTRACTOR
+// MAIN EXTRACTION
 // =============================================================
 
 function extractKnowledge(rawData) {
   const results = [];
 
-  // -----------------------------------------------------------
-  // CASE 1: Structured JSON object
-  // -----------------------------------------------------------
-
+  // Structured object
   if (
     typeof rawData === "object" &&
     rawData !== null &&
     !Array.isArray(rawData)
   ) {
-    extractObject(rawData, results);
+    extractObject(
+      rawData,
+      results
+    );
   }
 
-  // -----------------------------------------------------------
-  // CASE 2: Array
-  // -----------------------------------------------------------
-
+  // Array
   else if (Array.isArray(rawData)) {
-    extractArray(rawData, results);
+    extractArray(
+      rawData,
+      results
+    );
   }
 
-  // -----------------------------------------------------------
-  // CASE 3: Raw text
-  // -----------------------------------------------------------
-
+  // Raw text
   else if (typeof rawData === "string") {
-    extractText(rawData, results);
+    extractText(
+      rawData,
+      results
+    );
   }
 
-  // -----------------------------------------------------------
-  // CASE 4: Number / boolean / other
-  // -----------------------------------------------------------
-
+  // Number / boolean
   else {
     results.push({
       field: "pending",
@@ -323,7 +329,11 @@ function extractKnowledge(rawData) {
 // OBJECT EXTRACTION
 // =============================================================
 
-function extractObject(obj, results, parentKey = "") {
+function extractObject(
+  obj,
+  results,
+  parentKey = ""
+) {
   for (const [rawKey, rawValue] of Object.entries(obj)) {
     if (
       rawKey === null ||
@@ -333,9 +343,14 @@ function extractObject(obj, results, parentKey = "") {
       continue;
     }
 
-    const field = makeFieldName(rawKey);
+    const field =
+      makeFieldName(rawKey);
 
-    // Ignore obvious metadata/junk fields.
+    if (!field) {
+      continue;
+    }
+
+    // Ignore technical fields.
     if (isJunkField(field)) {
       continue;
     }
@@ -349,7 +364,12 @@ function extractObject(obj, results, parentKey = "") {
       typeof rawValue === "object" &&
       !Array.isArray(rawValue)
     ) {
-      extractObject(rawValue, results, field);
+      extractObject(
+        rawValue,
+        results,
+        field
+      );
+
       continue;
     }
 
@@ -358,7 +378,8 @@ function extractObject(obj, results, parentKey = "") {
     // ---------------------------------------------------------
 
     if (Array.isArray(rawValue)) {
-      const cleanedArray = cleanArray(rawValue);
+      const cleanedArray =
+        cleanArray(rawValue);
 
       if (cleanedArray.length === 0) {
         continue;
@@ -373,7 +394,7 @@ function extractObject(obj, results, parentKey = "") {
     }
 
     // ---------------------------------------------------------
-    // Primitive value
+    // Primitive
     // ---------------------------------------------------------
 
     if (
@@ -381,16 +402,17 @@ function extractObject(obj, results, parentKey = "") {
       rawValue !== undefined &&
       String(rawValue).trim() !== ""
     ) {
-      const cleanedValue = cleanValue(rawValue);
+      const cleaned =
+        cleanValue(rawValue);
 
       if (
-        cleanedValue !== null &&
-        cleanedValue !== undefined &&
-        String(cleanedValue).trim() !== ""
+        cleaned !== null &&
+        cleaned !== undefined &&
+        String(cleaned).trim() !== ""
       ) {
         results.push({
           field,
-          data: cleanedValue
+          data: cleaned
         });
       }
     }
@@ -402,12 +424,18 @@ function extractObject(obj, results, parentKey = "") {
 // ARRAY EXTRACTION
 // =============================================================
 
-function extractArray(array, results) {
+function extractArray(
+  array,
+  results
+) {
   const primitiveValues = [];
   const objectValues = [];
 
   for (const item of array) {
-    if (item === null || item === undefined) {
+    if (
+      item === null ||
+      item === undefined
+    ) {
       continue;
     }
 
@@ -416,10 +444,18 @@ function extractArray(array, results) {
       !Array.isArray(item)
     ) {
       objectValues.push(item);
-    } else if (Array.isArray(item)) {
-      extractArray(item, results);
-    } else {
-      const cleaned = cleanValue(item);
+    }
+
+    else if (Array.isArray(item)) {
+      extractArray(
+        item,
+        results
+      );
+    }
+
+    else {
+      const cleaned =
+        cleanValue(item);
 
       if (
         cleaned !== null &&
@@ -434,80 +470,99 @@ function extractArray(array, results) {
   if (primitiveValues.length > 0) {
     results.push({
       field: "pending",
-      data: uniqueValues(primitiveValues)
+      data: uniqueValues(
+        primitiveValues
+      )
     });
   }
 
   for (const obj of objectValues) {
-    extractObject(obj, results);
+    extractObject(
+      obj,
+      results
+    );
   }
 }
 
 
 // =============================================================
-// TEXT EXTRACTION
+// RAW TEXT EXTRACTION
 // =============================================================
 
-function extractText(text, results) {
+function extractText(
+  text,
+  results
+) {
   // -----------------------------------------------------------
-  // 1. Normalize text
+  // Normalize
   // -----------------------------------------------------------
 
-  const normalized = normalizeText(text);
+  const normalized =
+    normalizeText(text);
 
   if (!normalized) {
     return;
   }
 
   // -----------------------------------------------------------
-  // 2. Split into useful lines
+  // Split lines
   // -----------------------------------------------------------
 
-  let lines = normalized
-    .split("\n")
-    .map(line => cleanLine(line))
-    .filter(Boolean);
+  let lines =
+    normalized
+      .split("\n")
+      .map(cleanLine)
+      .filter(Boolean);
 
   // -----------------------------------------------------------
-  // 3. Remove duplicate lines
+  // Remove duplicate lines
   // -----------------------------------------------------------
 
-  lines = uniqueValues(lines);
+  lines =
+    uniqueValues(lines);
 
   // -----------------------------------------------------------
-  // 4. Remove obvious website junk
+  // Remove obvious junk
   // -----------------------------------------------------------
 
-  lines = lines.filter(line => !isJunkLine(line));
+  lines =
+    lines.filter(
+      line => !isJunkLine(line)
+    );
 
   if (lines.length === 0) {
     return;
   }
 
-  // -----------------------------------------------------------
-  // 5. Detect explicit key/value patterns
-  // -----------------------------------------------------------
+  const consumedIndexes =
+    new Set();
 
-  const consumedIndexes = new Set();
+  // ===========================================================
+  // KEY : VALUE
+  // ===========================================================
 
-  for (let i = 0; i < lines.length; i++) {
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
     const line = lines[i];
 
-    // ---------------------------------------------------------
-    // Pattern:
-    //
-    // Phone: +91...
-    // Email: hello@example.com
-    // Address: ...
-    // ---------------------------------------------------------
-
-    const colonMatch = line.match(
-      /^([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})\s*:\s*(.+)$/
-    );
+    const colonMatch =
+      line.match(
+        /^([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})\s*:\s*(.+)$/
+      );
 
     if (colonMatch) {
-      const field = makeFieldName(colonMatch[1]);
-      const value = cleanValue(colonMatch[2]);
+      const field =
+        makeFieldName(
+          colonMatch[1]
+        );
+
+      const value =
+        cleanValue(
+          colonMatch[2]
+        );
 
       if (
         field &&
@@ -520,24 +575,30 @@ function extractText(text, results) {
         });
 
         consumedIndexes.add(i);
+
         continue;
       }
     }
 
-    // ---------------------------------------------------------
-    // Pattern:
-    //
-    // Phone - +91...
-    // Email - ...
-    // ---------------------------------------------------------
+    // =========================================================
+    // KEY - VALUE
+    // =========================================================
 
-    const dashMatch = line.match(
-      /^([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})\s+-\s+(.+)$/
-    );
+    const dashMatch =
+      line.match(
+        /^([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})\s+-\s+(.+)$/
+      );
 
     if (dashMatch) {
-      const field = makeFieldName(dashMatch[1]);
-      const value = cleanValue(dashMatch[2]);
+      const field =
+        makeFieldName(
+          dashMatch[1]
+        );
+
+      const value =
+        cleanValue(
+          dashMatch[2]
+        );
 
       if (
         field &&
@@ -550,16 +611,16 @@ function extractText(text, results) {
         });
 
         consumedIndexes.add(i);
-        continue;
       }
     }
   }
 
-  // -----------------------------------------------------------
-  // 6. Detect emails
-  // -----------------------------------------------------------
+  // ===========================================================
+  // EMAILS
+  // ===========================================================
 
-  const emails = extractEmails(normalized);
+  const emails =
+    extractEmails(normalized);
 
   if (emails.length > 0) {
     results.push({
@@ -568,11 +629,12 @@ function extractText(text, results) {
     });
   }
 
-  // -----------------------------------------------------------
-  // 7. Detect URLs
-  // -----------------------------------------------------------
+  // ===========================================================
+  // URLS
+  // ===========================================================
 
-  const urls = extractUrls(normalized);
+  const urls =
+    extractUrls(normalized);
 
   if (urls.length > 0) {
     results.push({
@@ -581,11 +643,12 @@ function extractText(text, results) {
     });
   }
 
-  // -----------------------------------------------------------
-  // 8. Detect phone numbers
-  // -----------------------------------------------------------
+  // ===========================================================
+  // PHONE NUMBERS
+  // ===========================================================
 
-  const phones = extractPhones(normalized);
+  const phones =
+    extractPhones(normalized);
 
   if (phones.length > 0) {
     results.push({
@@ -594,44 +657,82 @@ function extractText(text, results) {
     });
   }
 
-  // -----------------------------------------------------------
-  // 9. Detect "8000 + CUSTOMERS" type patterns
-  // -----------------------------------------------------------
+  // ===========================================================
+  // NUMBER + LABEL
+  //
+  // Example:
+  //
+  // 8000 + CUSTOMERS
+  // 10 + STYLISTS
+  // ===========================================================
 
-  for (let i = 0; i < lines.length; i++) {
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
     const line = lines[i];
 
-    const metricMatch = line.match(
-      /^([\d,.]+)\s*\+\s*([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})$/i
-    );
+    const metricMatch =
+      line.match(
+        /^([\d,.]+)\s*\+\s*([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})$/i
+      );
 
-    if (metricMatch) {
-      const number = parseNumber(metricMatch[1]);
-      const label = makeFieldName(metricMatch[2]);
-
-      if (label) {
-        results.push({
-          field: label,
-          data: number
-        });
-
-        consumedIndexes.add(i);
-      }
-    }
-  }
-
-  // -----------------------------------------------------------
-  // 10. Detect headings followed by lists
-  // -----------------------------------------------------------
-
-  for (let i = 0; i < lines.length; i++) {
-    if (consumedIndexes.has(i)) {
+    if (!metricMatch) {
       continue;
     }
 
-    const heading = lines[i];
+    const number =
+      parseNumber(
+        metricMatch[1]
+      );
 
-    if (!looksLikeHeading(heading)) {
+    const label =
+      makeFieldName(
+        metricMatch[2]
+      );
+
+    if (label) {
+      results.push({
+        field: label,
+        data: number
+      });
+
+      consumedIndexes.add(i);
+    }
+  }
+
+  // ===========================================================
+  // HEADING + LIST
+  //
+  // Example:
+  //
+  // Our Services
+  // Hair Care
+  // Skin Care
+  // Bridal
+  // Body Care
+  // ===========================================================
+
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
+    if (
+      consumedIndexes.has(i)
+    ) {
+      continue;
+    }
+
+    const heading =
+      lines[i];
+
+    if (
+      !looksLikeHeading(
+        heading
+      )
+    ) {
       continue;
     }
 
@@ -639,40 +740,69 @@ function extractText(text, results) {
 
     let j = i + 1;
 
-    while (j < lines.length) {
-      const candidate = lines[j];
+    while (
+      j < lines.length
+    ) {
+      const candidate =
+        lines[j];
 
-      if (consumedIndexes.has(j)) {
+      if (
+        consumedIndexes.has(j)
+      ) {
         j++;
         continue;
       }
 
-      if (isJunkLine(candidate)) {
+      if (
+        isJunkLine(candidate)
+      ) {
         j++;
         continue;
       }
 
-      if (looksLikeHeading(candidate)) {
-        break;
-      }
-
-      if (looksLikeLongSentence(candidate)) {
+      if (
+        looksLikeHeading(
+          candidate
+        )
+      ) {
         break;
       }
 
       if (
-        containsContactInformation(candidate) ||
+        looksLikeLongSentence(
+          candidate
+        )
+      ) {
+        break;
+      }
+
+      if (
+        containsContactInformation(
+          candidate
+        )
+      ) {
+        break;
+      }
+
+      if (
         looksLikeUrl(candidate)
       ) {
         break;
       }
 
       list.push(candidate);
+
       j++;
     }
 
-    if (list.length >= 2 && list.length <= 30) {
-      const field = makeFieldName(heading);
+    if (
+      list.length >= 2 &&
+      list.length <= 30
+    ) {
+      const field =
+        makeFieldName(
+          heading
+        );
 
       if (field) {
         results.push({
@@ -682,54 +812,78 @@ function extractText(text, results) {
 
         consumedIndexes.add(i);
 
-        for (let k = i + 1; k < j; k++) {
+        for (
+          let k = i + 1;
+          k < j;
+          k++
+        ) {
           consumedIndexes.add(k);
         }
       }
     }
   }
 
-  // -----------------------------------------------------------
-  // 11. Detect sentences containing obvious experience
-  // -----------------------------------------------------------
+  // ===========================================================
+  // EXPERIENCE
+  // ===========================================================
 
   for (const line of lines) {
-    const experienceMatch = line.match(
-      /\b(\d{1,3})\s*(?:\+?\s*)?(years?|yrs?)\b/i
-    );
+    const match =
+      line.match(
+        /\b(\d{1,3})\s*(?:\+?\s*)?(years?|yrs?)\b/i
+      );
 
-    if (experienceMatch) {
+    if (match) {
       results.push({
         field: "experience",
-        data: `${experienceMatch[1]} years`
+        data: `${match[1]} years`
       });
     }
   }
 
-  // -----------------------------------------------------------
-  // 12. Detect remaining meaningful text
-  // -----------------------------------------------------------
+  // ===========================================================
+  // REMAINING MEANINGFUL CONTENT
+  // ===========================================================
 
   const remaining = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    if (consumedIndexes.has(i)) {
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
+    if (
+      consumedIndexes.has(i)
+    ) {
       continue;
     }
 
-    const line = lines[i];
+    const line =
+      lines[i];
 
-    if (isJunkLine(line)) {
+    if (
+      isJunkLine(line)
+    ) {
       continue;
     }
 
-    // Contact information already handled.
-    if (containsContactInformation(line)) {
+    if (
+      containsContactInformation(
+        line
+      )
+    ) {
       continue;
     }
 
-    // Very short UI/navigation items.
-    if (isLikelyNavigation(line)) {
+    if (
+      isLikelyNavigation(line)
+    ) {
+      continue;
+    }
+
+    if (
+      line.length < 4
+    ) {
       continue;
     }
 
@@ -737,27 +891,34 @@ function extractText(text, results) {
   }
 
   // -----------------------------------------------------------
-  // 13. Group meaningful remaining content
+  // Anything useful but not confidently classified
+  // goes into pending.
   // -----------------------------------------------------------
 
-  const meaningful = remaining.filter(line => {
-    if (line.length < 4) {
-      return false;
-    }
-
-    if (isJunkLine(line)) {
-      return false;
-    }
-
-    return true;
-  });
-
-  if (meaningful.length > 0) {
+  if (
+    remaining.length > 0
+  ) {
     results.push({
       field: "pending",
-      data: uniqueValues(meaningful)
+      data: uniqueValues(
+        remaining
+      )
     });
   }
+}
+
+
+// =============================================================
+// URL DETECTION
+// =============================================================
+
+function looksLikeUrl(value) {
+  const text =
+    String(value).trim();
+
+  return /^https?:\/\/[^\s<>"']+$/i.test(
+    text
+  );
 }
 
 
@@ -780,27 +941,34 @@ function normalizeText(text) {
 function cleanLine(line) {
   return String(line)
     .replace(/\s+/g, " ")
-    .replace(/^[|•·▪▫►▶→]+/g, "")
-    .replace(/[|]+$/g, "")
+    .replace(
+      /^[|•·▪▫►▶→]+/g,
+      ""
+    )
+    .replace(
+      /[|]+$/g,
+      ""
+    )
     .trim();
 }
 
 
 // =============================================================
-// JUNK DETECTION
+// JUNK LINE DETECTION
 // =============================================================
 
 function isJunkLine(line) {
-  const normalized = line
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
+  const normalized =
+    line
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
 
   if (!normalized) {
     return true;
   }
 
-  // HTML/code artifacts
+  // HTML artifacts
   if (
     normalized === "-->" ||
     normalized === "<!--" ||
@@ -818,7 +986,6 @@ function isJunkLine(line) {
     return true;
   }
 
-  // Common footer/navigation junk.
   const junkPatterns = [
     /^copyright\b/,
     /^all rights reserved\b/,
@@ -863,20 +1030,36 @@ function isJunkLine(line) {
     /^null$/
   ];
 
-  for (const pattern of junkPatterns) {
-    if (pattern.test(normalized)) {
+  for (
+    const pattern of junkPatterns
+  ) {
+    if (
+      pattern.test(normalized)
+    ) {
       return true;
     }
   }
 
-  // Very obvious CSS / JS garbage.
+  // Obvious JS/CSS garbage
   if (
-    normalized.includes("function(") ||
-    normalized.includes("=> {") ||
-    normalized.includes("var ") ||
-    normalized.includes("const ") ||
-    normalized.includes("document.") ||
-    normalized.includes("window.")
+    normalized.includes(
+      "function("
+    ) ||
+    normalized.includes(
+      "=> {"
+    ) ||
+    normalized.includes(
+      "var "
+    ) ||
+    normalized.includes(
+      "const "
+    ) ||
+    normalized.includes(
+      "document."
+    ) ||
+    normalized.includes(
+      "window."
+    )
   ) {
     return true;
   }
@@ -885,22 +1068,27 @@ function isJunkLine(line) {
 }
 
 
+// =============================================================
+// JUNK FIELD DETECTION
+// =============================================================
+
 function isJunkField(field) {
-  const junk = new Set([
-    "id",
-    "created_at",
-    "updated_at",
-    "timestamp",
-    "metadata",
-    "html",
-    "raw_html",
-    "scripts",
-    "styles",
-    "css",
-    "javascript",
-    "class",
-    "class_name"
-  ]);
+  const junk =
+    new Set([
+      "id",
+      "created_at",
+      "updated_at",
+      "timestamp",
+      "metadata",
+      "html",
+      "raw_html",
+      "scripts",
+      "styles",
+      "css",
+      "javascript",
+      "class",
+      "class_name"
+    ]);
 
   return junk.has(field);
 }
@@ -911,9 +1099,12 @@ function isJunkField(field) {
 // =============================================================
 
 function isLikelyNavigation(line) {
-  const value = line.trim();
+  const value =
+    line.trim();
 
-  if (value.length > 50) {
+  if (
+    value.length > 50
+  ) {
     return false;
   }
 
@@ -951,32 +1142,31 @@ function isLikelyNavigation(line) {
 // =============================================================
 
 function looksLikeHeading(line) {
-  const value = line.trim();
+  const value =
+    line.trim();
 
   if (!value) {
     return false;
   }
 
-  if (value.length > 80) {
-    return false;
-  }
-
-  // A sentence with punctuation is less likely to be heading.
   if (
-    value.endsWith(".") &&
-    value.split(" ").length > 4
+    value.length > 80
   ) {
     return false;
   }
 
-  // Common heading signal: title-like text.
-  const words = value.split(/\s+/);
-
-  if (words.length <= 8) {
-    return true;
+  // Long sentence ending with punctuation
+  if (
+    value.endsWith(".") &&
+    value.split(/\s+/).length > 4
+  ) {
+    return false;
   }
 
-  return false;
+  const words =
+    value.split(/\s+/);
+
+  return words.length <= 8;
 }
 
 
@@ -989,7 +1179,7 @@ function looksLikeLongSentence(line) {
 
 
 // =============================================================
-// CONTACT DETECTION
+// CONTACT INFORMATION
 // =============================================================
 
 function containsContactInformation(value) {
@@ -1002,31 +1192,40 @@ function containsContactInformation(value) {
 
 
 function extractEmails(text) {
-  const matches = String(text).match(
-    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
-  );
+  const matches =
+    String(text).match(
+      /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
+    );
 
-  return uniqueValues(matches || []);
+  return uniqueValues(
+    matches || []
+  );
 }
 
 
 function extractUrls(text) {
-  const matches = String(text).match(
-    /https?:\/\/[^\s<>"']+/gi
-  );
+  const matches =
+    String(text).match(
+      /https?:\/\/[^\s<>"']+/gi
+    );
 
   return uniqueValues(
-    (matches || []).map(url =>
-      url.replace(/[),.;]+$/g, "")
+    (matches || []).map(
+      url =>
+        url.replace(
+          /[),.;]+$/g,
+          ""
+        )
     )
   );
 }
 
 
 function extractPhones(text) {
-  const matches = String(text).match(
-    /(?:\+?\d[\d\s().-]{7,}\d)/g
-  );
+  const matches =
+    String(text).match(
+      /(?:\+?\d[\d\s().-]{7,}\d)/g
+    );
 
   if (!matches) {
     return [];
@@ -1034,21 +1233,33 @@ function extractPhones(text) {
 
   return uniqueValues(
     matches
-      .map(phone =>
-        phone
-          .replace(/\s+/g, " ")
-          .trim()
+      .map(
+        phone =>
+          phone
+            .replace(
+              /\s+/g,
+              " "
+            )
+            .trim()
       )
       .filter(phone => {
-        const digits = phone.replace(/\D/g, "");
-        return digits.length >= 8 && digits.length <= 15;
+        const digits =
+          phone.replace(
+            /\D/g,
+            ""
+          );
+
+        return (
+          digits.length >= 8 &&
+          digits.length <= 15
+        );
       })
   );
 }
 
 
 // =============================================================
-// FIELD NAME GENERATION
+// FIELD NAME CREATION
 // =============================================================
 
 function makeFieldName(value) {
@@ -1059,26 +1270,41 @@ function makeFieldName(value) {
     return "";
   }
 
-  let field = String(value)
-    .trim()
-    .toLowerCase();
+  let field =
+    String(value)
+      .trim()
+      .toLowerCase();
 
-  // Replace symbols with spaces.
-  field = field
-    .replace(/&/g, " and ")
-    .replace(/['’]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+  field =
+    field
+      .replace(
+        /&/g,
+        " and "
+      )
+      .replace(
+        /['’]/g,
+        ""
+      )
+      .replace(
+        /[^a-z0-9]+/g,
+        " "
+      )
+      .trim();
 
-  // Convert to snake_case.
-  field = field
-    .split(/\s+/)
-    .filter(Boolean)
-    .join("_");
+  field =
+    field
+      .split(/\s+/)
+      .filter(Boolean)
+      .join("_");
 
-  // Avoid huge field names.
-  if (field.length > 100) {
-    field = field.slice(0, 100);
+  if (
+    field.length > 100
+  ) {
+    field =
+      field.slice(
+        0,
+        100
+      );
   }
 
   return field;
@@ -1104,9 +1330,13 @@ function cleanValue(value) {
     return value;
   }
 
-  const text = String(value)
-    .replace(/\s+/g, " ")
-    .trim();
+  const text =
+    String(value)
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
 
   if (!text) {
     return null;
@@ -1119,7 +1349,9 @@ function cleanValue(value) {
 function cleanArray(array) {
   const result = [];
 
-  for (const item of array) {
+  for (
+    const item of array
+  ) {
     if (
       item === null ||
       item === undefined
@@ -1134,7 +1366,8 @@ function cleanArray(array) {
       continue;
     }
 
-    const cleaned = cleanValue(item);
+    const cleaned =
+      cleanValue(item);
 
     if (
       cleaned !== null &&
@@ -1145,7 +1378,9 @@ function cleanArray(array) {
     }
   }
 
-  return uniqueValues(result);
+  return uniqueValues(
+    result
+  );
 }
 
 
@@ -1154,13 +1389,20 @@ function cleanArray(array) {
 // =============================================================
 
 function parseNumber(value) {
-  const cleaned = String(value)
-    .replace(/,/g, "")
-    .trim();
+  const cleaned =
+    String(value)
+      .replace(
+        /,/g,
+        ""
+      )
+      .trim();
 
-  const number = Number(cleaned);
+  const number =
+    Number(cleaned);
 
-  if (Number.isFinite(number)) {
+  if (
+    Number.isFinite(number)
+  ) {
     return number;
   }
 
@@ -1173,18 +1415,36 @@ function parseNumber(value) {
 // =============================================================
 
 function uniqueValues(values) {
-  const seen = new Set();
+  const seen =
+    new Set();
+
   const output = [];
 
-  for (const value of values || []) {
-    const key =
-      typeof value === "object"
-        ? JSON.stringify(value)
-        : String(value)
-            .trim()
-            .toLowerCase();
+  for (
+    const value of values || []
+  ) {
+    let key;
 
-    if (seen.has(key)) {
+    if (
+      typeof value === "object"
+    ) {
+      try {
+        key =
+          JSON.stringify(value);
+      } catch {
+        key =
+          String(value);
+      }
+    } else {
+      key =
+        String(value)
+          .trim()
+          .toLowerCase();
+    }
+
+    if (
+      seen.has(key)
+    ) {
       continue;
     }
 
@@ -1197,13 +1457,16 @@ function uniqueValues(values) {
 
 
 // =============================================================
-// RESULT CLEANING
+// FINAL RESULT CLEANING
 // =============================================================
 
 function cleanResults(results) {
-  const grouped = new Map();
+  const grouped =
+    new Map();
 
-  for (const item of results) {
+  for (
+    const item of results
+  ) {
     if (
       !item ||
       !item.field
@@ -1211,7 +1474,10 @@ function cleanResults(results) {
       continue;
     }
 
-    const field = makeFieldName(item.field);
+    const field =
+      makeFieldName(
+        item.field
+      );
 
     if (!field) {
       continue;
@@ -1225,45 +1491,73 @@ function cleanResults(results) {
     }
 
     const cleanedData =
-      cleanValueDeep(item.data);
+      cleanValueDeep(
+        item.data
+      );
 
     if (
       cleanedData === null ||
-      cleanedData === undefined
+      cleanedData === undefined ||
+      cleanedData === ""
     ) {
       continue;
     }
 
-    if (!grouped.has(field)) {
-      grouped.set(field, []);
+    if (
+      !grouped.has(field)
+    ) {
+      grouped.set(
+        field,
+        []
+      );
     }
 
-    grouped.get(field).push(cleanedData);
+    grouped
+      .get(field)
+      .push(cleanedData);
   }
 
   const output = [];
 
-  for (const [field, values] of grouped.entries()) {
+  for (
+    const [field, values]
+    of grouped.entries()
+  ) {
     // ---------------------------------------------------------
-    // Merge multiple values for the same field.
+    // pending
     // ---------------------------------------------------------
 
-    if (field === "pending") {
+    if (
+      field === "pending"
+    ) {
       const flattened = [];
 
-      for (const value of values) {
-        if (Array.isArray(value)) {
-          flattened.push(...value);
+      for (
+        const value of values
+      ) {
+        if (
+          Array.isArray(value)
+        ) {
+          flattened.push(
+            ...value
+          );
         } else {
-          flattened.push(value);
+          flattened.push(
+            value
+          );
         }
       }
 
-      const unique = uniqueValues(flattened);
+      const unique =
+        uniqueValues(
+          flattened
+        );
 
-      if (unique.length > 0) {
+      if (
+        unique.length > 0
+      ) {
         output.push({
-          field,
+          field: "pending",
           data: unique
         });
       }
@@ -1271,8 +1565,13 @@ function cleanResults(results) {
       continue;
     }
 
-    // If there is only one value, keep it simple.
-    if (values.length === 1) {
+    // ---------------------------------------------------------
+    // One value
+    // ---------------------------------------------------------
+
+    if (
+      values.length === 1
+    ) {
       output.push({
         field,
         data: values[0]
@@ -1281,20 +1580,33 @@ function cleanResults(results) {
       continue;
     }
 
-    // Multiple values.
+    // ---------------------------------------------------------
+    // Multiple values
+    // ---------------------------------------------------------
+
     const flattened = [];
 
-    for (const value of values) {
-      if (Array.isArray(value)) {
-        flattened.push(...value);
+    for (
+      const value of values
+    ) {
+      if (
+        Array.isArray(value)
+      ) {
+        flattened.push(
+          ...value
+        );
       } else {
-        flattened.push(value);
+        flattened.push(
+          value
+        );
       }
     }
 
     output.push({
       field,
-      data: uniqueValues(flattened)
+      data: uniqueValues(
+        flattened
+      )
     });
   }
 
@@ -1302,10 +1614,19 @@ function cleanResults(results) {
 }
 
 
+// =============================================================
+// DEEP CLEAN
+// =============================================================
+
 function cleanValueDeep(value) {
-  if (Array.isArray(value)) {
+  if (
+    Array.isArray(value)
+  ) {
     return value
-      .map(item => cleanValueDeep(item))
+      .map(
+        item =>
+          cleanValueDeep(item)
+      )
       .filter(
         item =>
           item !== null &&
@@ -1320,22 +1641,29 @@ function cleanValueDeep(value) {
   ) {
     const result = {};
 
-    for (const [key, val] of Object.entries(value)) {
-      const cleaned = cleanValueDeep(val);
+    for (
+      const [key, val]
+      of Object.entries(value)
+    ) {
+      const cleaned =
+        cleanValueDeep(val);
 
       if (
         cleaned !== null &&
         cleaned !== undefined &&
         cleaned !== ""
       ) {
-        result[key] = cleaned;
+        result[key] =
+          cleaned;
       }
     }
 
     return result;
   }
 
-  if (typeof value === "string") {
+  if (
+    typeof value === "string"
+  ) {
     return cleanValue(value);
   }
 
@@ -1344,15 +1672,19 @@ function cleanValueDeep(value) {
 
 
 // =============================================================
-// SUPABASE HELPERS
+// SUPABASE HEADERS
 // =============================================================
 
 function supabaseHeaders(env) {
   return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    apikey:
+      env.SUPABASE_SERVICE_ROLE_KEY,
+
     Authorization:
       `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json"
+
+    "Content-Type":
+      "application/json"
   };
 }
 
@@ -1372,24 +1704,36 @@ async function updateBusinessDataStatus(
 
   const body = {
     ai_status: status,
-    ai_error: errorMessage || null,
-    updated_at: new Date().toISOString()
+    ai_error:
+      errorMessage || null,
+    updated_at:
+      new Date().toISOString()
   };
 
-  const response = await fetch(url, {
-    method: "PATCH",
-    headers: {
-      ...supabaseHeaders(env),
-      Prefer: "return=minimal"
-    },
-    body: JSON.stringify(body)
-  });
+  const response =
+    await fetch(
+      url,
+      {
+        method: "PATCH",
 
-  if (!response.ok) {
-    const errorText = await response.text();
+        headers: {
+          ...supabaseHeaders(env),
+          Prefer: "return=minimal"
+        },
+
+        body:
+          JSON.stringify(body)
+      }
+    );
+
+  if (
+    !response.ok
+  ) {
+    const errorText =
+      await response.text();
 
     console.error(
-      "Failed to update business_data status:",
+      "Failed to update business_data:",
       errorText
     );
   }
@@ -1397,7 +1741,7 @@ async function updateBusinessDataStatus(
 
 
 // =============================================================
-// UPSERT BUSINESS KNOWLEDGE
+// UPSERT business_knowledge
 // =============================================================
 
 async function upsertKnowledge(
@@ -1408,7 +1752,7 @@ async function upsertKnowledge(
   sourceUrl
 ) {
   // -----------------------------------------------------------
-  // 1. Find existing field
+  // Find existing field
   // -----------------------------------------------------------
 
   const selectUrl =
@@ -1417,12 +1761,19 @@ async function upsertKnowledge(
     `&field=eq.${encodeURIComponent(field)}` +
     `&select=*`;
 
-  const selectResponse = await fetch(selectUrl, {
-    method: "GET",
-    headers: supabaseHeaders(env)
-  });
+  const selectResponse =
+    await fetch(
+      selectUrl,
+      {
+        method: "GET",
+        headers:
+          supabaseHeaders(env)
+      }
+    );
 
-  if (!selectResponse.ok) {
+  if (
+    !selectResponse.ok
+  ) {
     const errorText =
       await selectResponse.text();
 
@@ -1435,7 +1786,7 @@ async function upsertKnowledge(
     await selectResponse.json();
 
   // -----------------------------------------------------------
-  // 2. Create new row
+  // INSERT
   // -----------------------------------------------------------
 
   if (
@@ -1446,32 +1797,49 @@ async function upsertKnowledge(
       new Date().toISOString();
 
     const insertBody = {
-      application_id: applicationId,
+      application_id:
+        applicationId,
+
       field,
+
       data,
-      created_at: now,
-      updated_at: now,
-      source_urls: sourceUrl
-        ? [sourceUrl]
-        : []
+
+      created_at:
+        now,
+
+      updated_at:
+        now,
+
+      source_urls:
+        sourceUrl
+          ? [sourceUrl]
+          : []
     };
 
     const insertUrl =
       `${env.SUPABASE_URL}/rest/v1/business_knowledge`;
 
-    const insertResponse = await fetch(
-      insertUrl,
-      {
-        method: "POST",
-        headers: {
-          ...supabaseHeaders(env),
-          Prefer: "return=minimal"
-        },
-        body: JSON.stringify(insertBody)
-      }
-    );
+    const insertResponse =
+      await fetch(
+        insertUrl,
+        {
+          method: "POST",
 
-    if (!insertResponse.ok) {
+          headers: {
+            ...supabaseHeaders(env),
+            Prefer: "return=minimal"
+          },
+
+          body:
+            JSON.stringify(
+              insertBody
+            )
+        }
+      );
+
+    if (
+      !insertResponse.ok
+    ) {
       const errorText =
         await insertResponse.text();
 
@@ -1484,7 +1852,7 @@ async function upsertKnowledge(
   }
 
   // -----------------------------------------------------------
-  // 3. Update existing row
+  // UPDATE
   // -----------------------------------------------------------
 
   const existing =
@@ -1497,19 +1865,26 @@ async function upsertKnowledge(
     );
 
   const existingUrls =
-    Array.isArray(existing.source_urls)
+    Array.isArray(
+      existing.source_urls
+    )
       ? existing.source_urls
       : [];
 
   const mergedUrls =
     uniqueValues([
       ...existingUrls,
-      ...(sourceUrl ? [sourceUrl] : [])
+      ...(sourceUrl
+        ? [sourceUrl]
+        : [])
     ]);
 
   const updateBody = {
     data: mergedData,
-    source_urls: mergedUrls,
+
+    source_urls:
+      mergedUrls,
+
     updated_at:
       new Date().toISOString()
   };
@@ -1518,19 +1893,27 @@ async function upsertKnowledge(
     `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
     `?id=eq.${encodeURIComponent(existing.id)}`;
 
-  const updateResponse = await fetch(
-    updateUrl,
-    {
-      method: "PATCH",
-      headers: {
-        ...supabaseHeaders(env),
-        Prefer: "return=minimal"
-      },
-      body: JSON.stringify(updateBody)
-    }
-  );
+  const updateResponse =
+    await fetch(
+      updateUrl,
+      {
+        method: "PATCH",
 
-  if (!updateResponse.ok) {
+        headers: {
+          ...supabaseHeaders(env),
+          Prefer: "return=minimal"
+        },
+
+        body:
+          JSON.stringify(
+            updateBody
+          )
+      }
+    );
+
+  if (
+    !updateResponse.ok
+  ) {
     const errorText =
       await updateResponse.text();
 
@@ -1542,17 +1925,14 @@ async function upsertKnowledge(
 
 
 // =============================================================
-// MERGE KNOWLEDGE DATA
+// MERGE KNOWLEDGE
 // =============================================================
 
 function mergeKnowledgeData(
   oldData,
   newData
 ) {
-  // -----------------------------------------------------------
   // Arrays
-  // -----------------------------------------------------------
-
   if (
     Array.isArray(oldData) &&
     Array.isArray(newData)
@@ -1563,14 +1943,12 @@ function mergeKnowledgeData(
     ]);
   }
 
-  // -----------------------------------------------------------
   // Objects
-  // -----------------------------------------------------------
-
   if (
     oldData &&
     typeof oldData === "object" &&
     !Array.isArray(oldData) &&
+
     newData &&
     typeof newData === "object" &&
     !Array.isArray(newData)
@@ -1581,12 +1959,7 @@ function mergeKnowledgeData(
     };
   }
 
-  // -----------------------------------------------------------
-  // Scalar values
-  //
-  // Newer information replaces older information.
-  // -----------------------------------------------------------
-
+  // New data replaces old scalar.
   return newData;
 }
 
@@ -1595,13 +1968,22 @@ function mergeKnowledgeData(
 // JSON RESPONSE
 // =============================================================
 
-function jsonResponse(data, status = 200) {
+function jsonResponse(
+  data,
+  status = 200
+) {
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
       status,
+
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type":
+          "application/json"
       }
     }
   );
