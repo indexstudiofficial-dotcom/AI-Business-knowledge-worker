@@ -1,263 +1,363 @@
 /**
  * Reportli AI
- * AI Business Knowledge Worker
+ * ai-business-knowledge-worker
  *
- * Purpose:
- *   Convert raw business_data rows into normalized business_knowledge.
+ * GENERIC STRUCTURAL KNOWLEDGE EXTRACTOR
  *
  * IMPORTANT:
- *   - No AI
- *   - No website scraping
- *   - No business-specific fields
- *   - No hardcoded business vocabulary
- *   - Generic structural/pattern-based extraction only
+ * ------------------------------------------------------------
+ * This worker does NOT understand business categories.
  *
- * Flow:
+ * It does NOT contain:
+ *   dental
+ *   restaurant
+ *   hotel
+ *   doctor
+ *   salon
+ *   services
+ *   products
+ *   menu
+ *   clinic
+ *   etc.
  *
- * business_data INSERT
- *        ↓
- * Supabase Database Webhook
- *        ↓
- * this Worker
- *        ↓
- * generic parser
- *        ↓
- * business_knowledge
+ * It only understands:
+ *
+ *   - JSON/object structure
+ *   - explicit key/value relationships
+ *   - explicit "label: value" relationships
+ *   - repeated website boilerplate
+ *   - generic text structure
+ *   - generic formats such as email / URL / phone / date
+ *   - headings and their following content
+ *   - lists
+ *
+ * The worker reads business_data.
+ * It NEVER scrapes the website.
+ * It NEVER calls an AI API.
+ * ------------------------------------------------------------
  */
 
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
-const MAX_TEXT_LENGTH = 50000;
-const MAX_ARRAY_ITEMS = 500;
-const MAX_OBJECT_KEYS = 500;
-const MAX_PENDING_ITEMS = 100;
-
-const JUNK_EXACT = new Set([
-  "skip to content",
-  "skip to footer",
-  "skip to sidebar",
-  "menu",
-  "close",
-  "search",
-  "submit",
-  "cancel",
-  "cancel reply",
-  "leave a comment",
-  "reply",
-  "read more",
-  "learn more",
-  "click here",
-  "back to top",
-  "previous",
-  "next",
-  "home",
-  "privacy policy",
-  "terms and conditions"
-]);
-
-const JUNK_PATTERNS = [
-  /^skip to /i,
-  /^leave a comment$/i,
-  /^cancel reply$/i,
-  /^search$/i,
-  /^close$/i,
-  /^menu$/i,
-  /^read more$/i,
-  /^learn more$/i,
-  /^click here$/i
-];
 
 // ============================================================
-// MAIN ENTRY
+// CONFIG
+// ============================================================
+
+const MAX_ROWS = 500;
+const MAX_LINES_PER_PAGE = 5000;
+const MAX_TEXT_LENGTH = 100000;
+const MAX_SECTION_LENGTH = 50000;
+
+const MIN_REPEATED_PAGES = 2;
+
+const MAX_PENDING = 100;
+
+
+// ============================================================
+// MAIN
 // ============================================================
 
 export default {
   async fetch(request, env) {
+
     if (request.method !== "POST") {
-      return json(
-        {
-          success: false,
-          error: "POST required"
-        },
-        405
-      );
+      return json({
+        success: false,
+        error: "POST required"
+      }, 405);
+    }
+
+    let payload;
+
+    try {
+      payload = await request.json();
+    } catch {
+      return json({
+        success: false,
+        error: "Invalid JSON"
+      }, 400);
     }
 
     try {
-      const payload = await request.json();
-
-      console.log(
-        "Webhook received:",
-        JSON.stringify(payload).slice(0, 5000)
-      );
 
       // ------------------------------------------------------
-      // Extract the actual business_data record.
-      // Supports:
-      //
-      // 1. Direct Supabase webhook payload
-      // 2. { record: {...} }
-      // 3. { new_record: {...} }
-      // 4. { data: { record: {...} } }
-      // 5. { data: { new_record: {...} } }
+      // Find webhook record
       // ------------------------------------------------------
 
       const record = extractRecord(payload);
 
       if (!record) {
-        return json(
-          {
-            success: false,
-            error: "Could not find business_data record in webhook payload"
-          },
-          400
-        );
+        return json({
+          success: false,
+          error: "business_data record not found"
+        }, 400);
       }
 
       const applicationId = record.application_id;
-      const sourceUrl = cleanString(record.source_url);
 
       if (!applicationId) {
-        return json(
-          {
-            success: false,
-            error: "application_id is missing"
-          },
-          400
-        );
+        return json({
+          success: false,
+          error: "application_id missing"
+        }, 400);
       }
 
-      if (!record.data) {
+
+      // ------------------------------------------------------
+      // IMPORTANT:
+      //
+      // Do NOT process only the webhook row.
+      //
+      // Fetch all business_data rows for this application.
+      //
+      // This allows us to detect repeated navigation/footer/
+      // header content across pages.
+      // ------------------------------------------------------
+
+      const rows = await getBusinessData(
+        env,
+        applicationId
+      );
+
+
+      if (!rows.length) {
+
         await updateBusinessDataStatus(
           env,
           record.id,
           "error",
-          "data is missing"
+          "No business_data rows found"
         );
 
-        return json(
+        return json({
+          success: false,
+          error: "No business_data rows found"
+        }, 404);
+      }
+
+
+      // ------------------------------------------------------
+      // Build page representations
+      // ------------------------------------------------------
+
+      const pages = [];
+
+      for (const row of rows) {
+
+        const page = createPageRepresentation(row);
+
+        if (!page) {
+          continue;
+        }
+
+        pages.push(page);
+      }
+
+
+      // ------------------------------------------------------
+      // Find repeated content across pages.
+      //
+      // Example:
+      //
+      // About
+      // Services
+      // Portfolio
+      // Testimonials
+      // Blog
+      //
+      // repeated on every page.
+      //
+      // We remove these blocks structurally instead of
+      // hardcoding their names.
+      // ------------------------------------------------------
+
+      const repeated = findRepeatedLines(pages);
+
+
+      // ------------------------------------------------------
+      // Parse every page
+      // ------------------------------------------------------
+
+      const knowledge = [];
+      const pending = [];
+
+      for (const page of pages) {
+
+        const cleanedLines =
+          removeRepeatedLines(
+            page.lines,
+            repeated
+          );
+
+        const parsed =
+          parsePage(
+            cleanedLines,
+            page
+          );
+
+
+        for (const item of parsed.knowledge) {
+          knowledge.push(item);
+        }
+
+
+        for (const item of parsed.pending) {
+
+          if (pending.length < MAX_PENDING) {
+            pending.push(item);
+          }
+
+        }
+      }
+
+
+      // ------------------------------------------------------
+      // Deduplicate knowledge
+      // ------------------------------------------------------
+
+      const finalKnowledge =
+        mergeKnowledge(
+          knowledge
+        );
+
+
+      // ------------------------------------------------------
+      // Save knowledge
+      // ------------------------------------------------------
+
+      let saved = 0;
+
+      for (const item of finalKnowledge) {
+
+        const ok =
+          await saveKnowledge(
+            env,
+            applicationId,
+            item
+          );
+
+        if (ok) {
+          saved++;
+        }
+      }
+
+
+      // ------------------------------------------------------
+      // Save pending content
+      // ------------------------------------------------------
+
+      for (const item of pending) {
+
+        await saveKnowledge(
+          env,
+          applicationId,
           {
-            success: false,
-            error: "business_data.data is missing"
-          },
-          400
+            field: "pending",
+            data: item.data,
+            sourceUrls: item.sourceUrls
+          }
         );
       }
 
+
       // ------------------------------------------------------
-      // Parse raw data
+      // Mark current webhook row completed
       // ------------------------------------------------------
 
-      const result = parseGenericData(record.data);
-
-      console.log(
-        "Parser result:",
-        JSON.stringify({
-          extracted: result.extracted.length,
-          pending: result.pending.length,
-          removed: result.removed
-        })
+      await updateBusinessDataStatus(
+        env,
+        record.id,
+        "completed",
+        null
       );
 
-      // ------------------------------------------------------
-      // Save extracted knowledge
-      // ------------------------------------------------------
-
-      let savedCount = 0;
-
-      for (const item of result.extracted) {
-        const saved = await upsertKnowledge(
-          env,
-          applicationId,
-          item.field,
-          item.data,
-          sourceUrl
-        );
-
-        if (saved) {
-          savedCount++;
-        }
-      }
-
-      // ------------------------------------------------------
-      // Save meaningful unknown content as pending
-      // ------------------------------------------------------
-
-      for (const item of result.pending.slice(0, MAX_PENDING_ITEMS)) {
-        const saved = await savePending(
-          env,
-          applicationId,
-          item,
-          sourceUrl
-        );
-
-        if (saved) {
-          savedCount++;
-        }
-      }
-
-      // ------------------------------------------------------
-      // Mark source row as completed
-      // ------------------------------------------------------
-
-      if (record.id) {
-        await updateBusinessDataStatus(
-          env,
-          record.id,
-          "completed",
-          null
-        );
-      }
 
       return json({
         success: true,
         application_id: applicationId,
-        source_url: sourceUrl,
-        extracted_count: result.extracted.length,
-        pending_count: result.pending.length,
-        removed_count: result.removed,
-        saved_count: savedCount
+        business_data_rows: rows.length,
+        pages_processed: pages.length,
+        repeated_lines_removed: repeated.size,
+        knowledge_records: finalKnowledge.length,
+        saved,
+        pending: pending.length
       });
-    } catch (error) {
-      console.error("Worker error:", error);
 
-      return json(
-        {
-          success: false,
-          error: error?.message || String(error)
-        },
-        500
+    } catch (error) {
+
+      console.error(
+        "Knowledge worker error:",
+        error
       );
+
+      try {
+
+        const record =
+          extractRecord(payload);
+
+        if (record?.id) {
+
+          await updateBusinessDataStatus(
+            env,
+            record.id,
+            "error",
+            error?.message || String(error)
+          );
+        }
+
+      } catch (statusError) {
+
+        console.error(
+          "Could not update error status:",
+          statusError
+        );
+      }
+
+
+      return json({
+        success: false,
+        error:
+          error?.message ||
+          String(error)
+      }, 500);
     }
   }
 };
 
 
 // ============================================================
-// WEBHOOK RECORD EXTRACTION
+// WEBHOOK RECORD
 // ============================================================
 
 function extractRecord(payload) {
+
   if (!payload || typeof payload !== "object") {
     return null;
   }
 
+
   // Direct Supabase Database Webhook payload
+
   if (
     payload.id &&
     payload.application_id &&
-    payload.field &&
-    Object.prototype.hasOwnProperty.call(payload, "data")
+    Object.prototype.hasOwnProperty.call(
+      payload,
+      "data"
+    )
   ) {
     return payload;
   }
 
-  // Common wrappers
-  if (payload.record && typeof payload.record === "object") {
+
+  // Wrapped payload
+
+  if (
+    payload.record &&
+    typeof payload.record === "object"
+  ) {
     return payload.record;
   }
+
 
   if (
     payload.new_record &&
@@ -265,6 +365,7 @@ function extractRecord(payload) {
   ) {
     return payload.new_record;
   }
+
 
   if (
     payload.data &&
@@ -275,6 +376,7 @@ function extractRecord(payload) {
     return payload.data.record;
   }
 
+
   if (
     payload.data &&
     typeof payload.data === "object" &&
@@ -284,919 +386,1183 @@ function extractRecord(payload) {
     return payload.data.new_record;
   }
 
+
   return null;
 }
 
 
 // ============================================================
-// GENERIC PARSER
+// SUPABASE
 // ============================================================
 
-function parseGenericData(input) {
-  const extracted = [];
-  const pending = [];
-
-  const state = {
-    extractedKeys: new Set(),
-    seenText: new Set(),
-    removed: 0,
-    pendingCount: 0
-  };
-
-  walkValue(
-    input,
-    [],
-    extracted,
-    pending,
-    state
-  );
+function supabaseHeaders(env) {
 
   return {
-    extracted: deduplicateExtracted(extracted),
-    pending: deduplicatePending(pending),
-    removed: state.removed
+    apikey:
+      env.SUPABASE_SERVICE_ROLE_KEY,
+
+    Authorization:
+      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+
+    "Content-Type":
+      "application/json"
   };
 }
 
 
+function tableUrl(env, table) {
+
+  return `${env.SUPABASE_URL}/rest/v1/${table}`;
+}
+
+
 // ============================================================
-// RECURSIVE VALUE WALKER
+// GET ALL BUSINESS DATA FOR APPLICATION
 // ============================================================
 
-function walkValue(
-  value,
-  path,
-  extracted,
-  pending,
-  state
+async function getBusinessData(
+  env,
+  applicationId
 ) {
-  if (value === null || value === undefined) {
-    return;
-  }
 
-  // ----------------------------------------------------------
-  // STRING
-  // ----------------------------------------------------------
+  const url =
+    `${tableUrl(
+      env,
+      "business_data"
+    )}` +
+    `?application_id=eq.${encodeURIComponent(
+      applicationId
+    )}` +
+    `&select=id,application_id,field,data,source_url,created_at,updated_at` +
+    `&order=created_at.asc` +
+    `&limit=${MAX_ROWS}`;
 
-  if (typeof value === "string") {
-    processString(
-      value,
-      path,
-      extracted,
-      pending,
-      state
+
+  const response =
+    await fetch(
+      url,
+      {
+        method: "GET",
+        headers:
+          supabaseHeaders(env)
+      }
     );
 
-    return;
+
+  if (!response.ok) {
+
+    throw new Error(
+      `Failed to read business_data: ${await response.text()}`
+    );
   }
 
+
+  return await response.json();
+}
+
+
+// ============================================================
+// PAGE REPRESENTATION
+// ============================================================
+
+function createPageRepresentation(row) {
+
+  if (!row) {
+    return null;
+  }
+
+
+  const sourceUrl =
+    cleanString(row.source_url);
+
+
+  const rawData =
+    row.data;
+
+
+  let text;
+
+
   // ----------------------------------------------------------
-  // NUMBER
+  // If scraper stored an object, preserve it separately.
   // ----------------------------------------------------------
 
   if (
-    typeof value === "number" &&
-    Number.isFinite(value)
+    rawData &&
+    typeof rawData === "object"
   ) {
-    if (path.length > 0) {
-      const field = normalizeFieldName(path[path.length - 1]);
 
-      if (field) {
-        addExtracted(
-          extracted,
-          field,
-          value,
-          state
-        );
-      }
-    }
+    return {
+      id: row.id,
+      sourceUrl,
+      originalData: rawData,
+      lines: objectToLines(
+        rawData
+      )
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // Otherwise process raw text.
+  // ----------------------------------------------------------
+
+  text =
+    cleanString(
+      rawData
+    );
+
+
+  if (!text) {
+    return null;
+  }
+
+
+  if (text.length > MAX_TEXT_LENGTH) {
+
+    text =
+      text.slice(
+        0,
+        MAX_TEXT_LENGTH
+      );
+  }
+
+
+  return {
+    id: row.id,
+    sourceUrl,
+    originalData: null,
+    lines:
+      textToLines(text)
+  };
+}
+
+
+// ============================================================
+// OBJECT → LINES
+// ============================================================
+
+function objectToLines(object) {
+
+  const lines = [];
+
+  walkObject(
+    object,
+    [],
+    lines
+  );
+
+  return lines;
+}
+
+
+function walkObject(
+  value,
+  path,
+  lines
+) {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return;
+  }
+
+
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+
+    lines.push({
+      text: normalizeText(
+        String(value)
+      ),
+
+      path: [...path],
+
+      explicit:
+        path.length > 0
+    });
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // BOOLEAN
-  // ----------------------------------------------------------
-
-  if (typeof value === "boolean") {
-    if (path.length > 0) {
-      const field = normalizeFieldName(path[path.length - 1]);
-
-      if (field) {
-        addExtracted(
-          extracted,
-          field,
-          value,
-          state
-        );
-      }
-    }
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // ARRAY
-  // ----------------------------------------------------------
 
   if (Array.isArray(value)) {
-    processArray(
-      value,
-      path,
-      extracted,
-      pending,
-      state
-    );
+
+    for (const item of value) {
+
+      walkObject(
+        item,
+        path,
+        lines
+      );
+    }
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // OBJECT
-  // ----------------------------------------------------------
 
   if (typeof value === "object") {
-    processObject(
-      value,
-      path,
-      extracted,
-      pending,
-      state
-    );
+
+    for (const [
+      key,
+      child
+    ] of Object.entries(value)) {
+
+      walkObject(
+        child,
+        [
+          ...path,
+          key
+        ],
+        lines
+      );
+    }
   }
 }
 
 
 // ============================================================
-// OBJECT PROCESSING
+// TEXT → LINES
 // ============================================================
 
-function processObject(
-  object,
-  path,
-  extracted,
-  pending,
-  state
-) {
-  const keys = Object.keys(object);
+function textToLines(text) {
 
-  for (
-    const key of keys.slice(0, MAX_OBJECT_KEYS)
-  ) {
-    const value = object[key];
+  return String(text)
+    .split(/\r?\n/)
+    .map(line => {
 
-    const normalizedKey = normalizeFieldName(key);
+      return {
+        text:
+          normalizeText(line),
 
-    if (!normalizedKey) {
-      walkValue(
-        value,
-        path,
-        extracted,
-        pending,
-        state
-      );
+        path: [],
 
-      continue;
-    }
+        explicit: false
+      };
 
-    // --------------------------------------------------------
-    // Preserve structured key/value relationships.
-    // This is generic and does not know what the key means.
-    // --------------------------------------------------------
+    })
+    .filter(item => item.text);
+}
 
-    if (isPrimitive(value)) {
-      if (
-        typeof value === "string" &&
-        isJunkText(value)
-      ) {
-        state.removed++;
+
+// ============================================================
+// REPEATED LINE DETECTION
+// ============================================================
+
+function findRepeatedLines(pages) {
+
+  const counts =
+    new Map();
+
+
+  for (const page of pages) {
+
+    // Only count a line once per page.
+    const seen =
+      new Set();
+
+
+    for (const item of page.lines) {
+
+      const key =
+        fingerprint(
+          item.text
+        );
+
+
+      if (!key) {
         continue;
       }
 
-      addExtracted(
-        extracted,
-        normalizedKey,
-        normalizePrimitive(value),
-        state
+
+      if (seen.has(key)) {
+        continue;
+      }
+
+
+      seen.add(key);
+
+
+      if (!counts.has(key)) {
+
+        counts.set(
+          key,
+          {
+            count: 0,
+            text: item.text
+          }
+        );
+      }
+
+
+      counts.get(key).count++;
+    }
+  }
+
+
+  const repeated =
+    new Set();
+
+
+  for (
+    const [
+      key,
+      value
+    ] of counts
+  ) {
+
+    if (
+      value.count >=
+      MIN_REPEATED_PAGES
+    ) {
+
+      repeated.add(key);
+    }
+  }
+
+
+  return repeated;
+}
+
+
+// ============================================================
+// REMOVE REPEATED CONTENT
+// ============================================================
+
+function removeRepeatedLines(
+  lines,
+  repeated
+) {
+
+  return lines.filter(
+    item => {
+
+      const key =
+        fingerprint(
+          item.text
+        );
+
+
+      if (
+        key &&
+        repeated.has(key) &&
+        !item.explicit
+      ) {
+
+        return false;
+      }
+
+
+      return true;
+    }
+  );
+}
+
+
+// ============================================================
+// PAGE PARSER
+// ============================================================
+
+function parsePage(
+  lines,
+  page
+) {
+
+  const knowledge = [];
+  const pending = [];
+
+
+  // ----------------------------------------------------------
+  // First: explicit object relationships.
+  //
+  // These are the safest possible relationships because the
+  // source itself gave us:
+  //
+  // key -> value
+  // ----------------------------------------------------------
+
+  for (const item of lines) {
+
+    if (
+      item.explicit &&
+      item.path.length > 0
+    ) {
+
+      const field =
+        normalizeFieldName(
+          item.path[
+            item.path.length - 1
+          ]
+        );
+
+
+      if (
+        field &&
+        item.text
+      ) {
+
+        knowledge.push({
+
+          field,
+
+          data:
+            item.text,
+
+          sourceUrls:
+            page.sourceUrl
+              ? [page.sourceUrl]
+              : []
+        });
+      }
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Then parse raw text structurally.
+  // ----------------------------------------------------------
+
+  const textLines =
+    lines
+      .filter(
+        item =>
+          !item.explicit
+      )
+      .map(
+        item =>
+          item.text
+      )
+      .filter(Boolean);
+
+
+  if (!textLines.length) {
+
+    return {
+      knowledge,
+      pending
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // Remove obvious duplicates inside this page.
+  // ----------------------------------------------------------
+
+  const uniqueLines =
+    uniqueTextLines(
+      textLines
+    );
+
+
+  // ----------------------------------------------------------
+  // Explicit "label: value" structures.
+  //
+  // This is allowed because the source itself provides the
+  // relationship.
+  // ----------------------------------------------------------
+
+  const consumed =
+    new Set();
+
+
+  for (
+    let i = 0;
+    i < uniqueLines.length;
+    i++
+  ) {
+
+    const parsed =
+      parseExplicitLabelValue(
+        uniqueLines[i]
       );
+
+
+    if (!parsed) {
+      continue;
+    }
+
+
+    knowledge.push({
+
+      field:
+        parsed.field,
+
+      data:
+        parsed.data,
+
+      sourceUrls:
+        page.sourceUrl
+          ? [page.sourceUrl]
+          : []
+    });
+
+
+    consumed.add(i);
+  }
+
+
+  // ----------------------------------------------------------
+  // Detect generic values.
+  //
+  // ONLY when the entire line itself clearly has that format.
+  //
+  // This prevents:
+  //
+  // "Root Canal Treatment (RCT)"
+  //
+  // from being treated as a field.
+  // ----------------------------------------------------------
+
+  for (
+    let i = 0;
+    i < uniqueLines.length;
+    i++
+  ) {
+
+    if (consumed.has(i)) {
+      continue;
+    }
+
+
+    const value =
+      detectStandaloneValue(
+        uniqueLines[i]
+      );
+
+
+    if (!value) {
+      continue;
+    }
+
+
+    knowledge.push({
+
+      field:
+        value.field,
+
+      data:
+        value.data,
+
+      sourceUrls:
+        page.sourceUrl
+          ? [page.sourceUrl]
+          : []
+    });
+
+
+    consumed.add(i);
+  }
+
+
+  // ----------------------------------------------------------
+  // Find actual structural sections.
+  // ----------------------------------------------------------
+
+  const sections =
+    findSections(
+      uniqueLines,
+      consumed
+    );
+
+
+  for (const section of sections) {
+
+    knowledge.push({
+
+      field:
+        normalizeFieldName(
+          section.heading
+        ),
+
+      data:
+        section.data,
+
+      sourceUrls:
+        page.sourceUrl
+          ? [page.sourceUrl]
+          : []
+    });
+
+
+    for (
+      const index of section.indices
+    ) {
+
+      consumed.add(index);
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Anything still meaningful but not structurally
+  // classifiable goes to pending.
+  //
+  // IMPORTANT:
+  // We do NOT invent a semantic field.
+  // ----------------------------------------------------------
+
+  const remaining = [];
+
+
+  for (
+    let i = 0;
+    i < uniqueLines.length;
+    i++
+  ) {
+
+    if (consumed.has(i)) {
+      continue;
+    }
+
+
+    const text =
+      uniqueLines[i];
+
+
+    if (
+      !isMeaningful(
+        text
+      )
+    ) {
+      continue;
+    }
+
+
+    remaining.push(text);
+  }
+
+
+  if (remaining.length) {
+
+    pending.push({
+
+      data: {
+
+        source_url:
+          page.sourceUrl || null,
+
+        text:
+          remaining.join("\n")
+      },
+
+      sourceUrls:
+        page.sourceUrl
+          ? [page.sourceUrl]
+          : []
+    });
+  }
+
+
+  return {
+    knowledge,
+    pending
+  };
+}
+
+
+// ============================================================
+// EXPLICIT LABEL/VALUE
+// ============================================================
+
+function parseExplicitLabelValue(
+  text
+) {
+
+  // Only a single clear delimiter.
+  //
+  // Example:
+  //
+  // Address: Something
+  //
+  // We do NOT treat:
+  //
+  // "A: B: C"
+  //
+  // as a field.
+
+  const match =
+    text.match(
+      /^([^:\n]{2,100}):\s*(.{1,10000})$/
+    );
+
+
+  if (!match) {
+    return null;
+  }
+
+
+  const label =
+    normalizeText(
+      match[1]
+    );
+
+
+  const value =
+    normalizeText(
+      match[2]
+    );
+
+
+  if (!label || !value) {
+    return null;
+  }
+
+
+  if (
+    label.split(/\s+/).length >
+    12
+  ) {
+    return null;
+  }
+
+
+  if (
+    isNavigationLike(
+      label
+    )
+  ) {
+    return null;
+  }
+
+
+  return {
+
+    field:
+      normalizeFieldName(
+        label
+      ),
+
+    data:
+      value
+  };
+}
+
+
+// ============================================================
+// STANDALONE FORMAT DETECTION
+// ============================================================
+
+function detectStandaloneValue(
+  text
+) {
+
+  const value =
+    normalizeText(
+      text
+    );
+
+
+  // Entire line is an email.
+  if (
+    looksLikeEmail(
+      value
+    )
+  ) {
+
+    return {
+      field: "email",
+      data: value
+    };
+  }
+
+
+  // Entire line is a URL.
+  if (
+    looksLikeUrl(
+      value
+    )
+  ) {
+
+    return {
+      field: "url",
+      data: value
+    };
+  }
+
+
+  // Entire line is a phone number.
+  if (
+    looksLikePhone(
+      value
+    )
+  ) {
+
+    return {
+      field: "phone",
+      data: value
+    };
+  }
+
+
+  // Entire line is a date.
+  if (
+    looksLikeDate(
+      value
+    )
+  ) {
+
+    return {
+      field: "date",
+      data: value
+    };
+  }
+
+
+  return null;
+}
+
+
+// ============================================================
+// SECTION DETECTION
+// ============================================================
+
+function findSections(
+  lines,
+  consumed
+) {
+
+  const sections = [];
+
+
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
+
+    if (consumed.has(i)) {
+      continue;
+    }
+
+
+    const heading =
+      lines[i];
+
+
+    if (
+      !looksLikeHeading(
+        heading
+      )
+    ) {
+      continue;
+    }
+
+
+    const nextIndex =
+      nextMeaningfulIndex(
+        lines,
+        i + 1,
+        consumed
+      );
+
+
+    if (
+      nextIndex === -1
+    ) {
+      continue;
+    }
+
+
+    const next =
+      lines[nextIndex];
+
+
+    // --------------------------------------------------------
+    // A heading followed by several short lines can be a list.
+    //
+    // Crucially:
+    //
+    // We require MULTIPLE list-like items.
+    //
+    // So:
+    //
+    // Root Canal
+    // Tooth Extraction
+    // Braces
+    //
+    // is treated as a list.
+    //
+    // But:
+    //
+    // Root Canal
+    // 02.
+    //
+    // is NOT treated as a relationship.
+    // --------------------------------------------------------
+
+    const list =
+      collectList(
+        lines,
+        nextIndex,
+        consumed
+      );
+
+
+    if (
+      list.items.length >= 2
+    ) {
+
+      sections.push({
+
+        heading,
+
+        data:
+          list.items,
+
+        indices:
+          [
+            i,
+            ...list.indices
+          ]
+      });
+
 
       continue;
     }
 
-    if (Array.isArray(value)) {
-      const cleanedArray = cleanArray(value);
 
-      if (cleanedArray.length > 0) {
-        addExtracted(
-          extracted,
-          normalizedKey,
-          cleanedArray,
-          state
-        );
-      }
+    // --------------------------------------------------------
+    // Heading followed by substantial prose.
+    //
+    // We require the following text to be long enough to look
+    // like content rather than another navigation item.
+    // --------------------------------------------------------
 
-      // Also inspect nested structures.
-      for (
-        const item of value.slice(0, MAX_ARRAY_ITEMS)
+    if (
+      isSubstantialText(
+        next
+      )
+    ) {
+
+      const content = [];
+
+
+      let j =
+        nextIndex;
+
+
+      while (
+        j < lines.length
       ) {
+
         if (
-          item &&
-          typeof item === "object"
+          consumed.has(j)
         ) {
-          walkValue(
-            item,
-            [...path, normalizedKey],
-            extracted,
-            pending,
-            state
+          j++;
+          continue;
+        }
+
+
+        const current =
+          lines[j];
+
+
+        if (
+          j !== nextIndex &&
+          looksLikeHeading(
+            current
+          )
+        ) {
+          break;
+        }
+
+
+        if (
+          isMeaningful(
+            current
+          )
+        ) {
+
+          content.push(
+            current
           );
+        }
+
+
+        j++;
+
+
+        if (
+          content.join("\n")
+            .length >=
+          MAX_SECTION_LENGTH
+        ) {
+          break;
         }
       }
 
-      continue;
-    }
 
-    if (
-      value &&
-      typeof value === "object"
-    ) {
-      // Preserve the object itself.
-      const cleanedObject = cleanObject(value);
+      if (content.length) {
 
-      if (
-        cleanedObject &&
-        Object.keys(cleanedObject).length > 0
-      ) {
-        addExtracted(
-          extracted,
-          normalizedKey,
-          cleanedObject,
-          state
-        );
+        sections.push({
+
+          heading,
+
+          data:
+            content.join("\n\n"),
+
+          indices:
+            [
+              i,
+              ...range(
+                nextIndex,
+                j
+              )
+            ]
+        });
       }
-
-      // Continue recursively.
-      walkValue(
-        value,
-        [...path, normalizedKey],
-        extracted,
-        pending,
-        state
-      );
     }
   }
+
+
+  return sections;
 }
 
 
 // ============================================================
-// ARRAY PROCESSING
+// LIST COLLECTION
 // ============================================================
 
-function processArray(
-  array,
-  path,
-  extracted,
-  pending,
-  state
+function collectList(
+  lines,
+  start,
+  consumed
 ) {
-  const cleaned = cleanArray(array);
 
-  if (cleaned.length === 0) {
-    return;
-  }
+  const items = [];
+  const indices = [];
 
-  // If an array belongs to a known structural key,
-  // preserve that relationship.
-  if (path.length > 0) {
-    const field = normalizeFieldName(
-      path[path.length - 1]
+
+  let i = start;
+
+
+  while (
+    i < lines.length
+  ) {
+
+    if (
+      consumed.has(i)
+    ) {
+      i++;
+      continue;
+    }
+
+
+    const text =
+      lines[i];
+
+
+    if (
+      !isListItemLike(
+        text
+      )
+    ) {
+      break;
+    }
+
+
+    // Do not accept very long prose as a list item.
+    if (
+      text.length > 180
+    ) {
+      break;
+    }
+
+
+    items.push(
+      text
     );
 
-    if (field) {
-      addExtracted(
-        extracted,
-        field,
-        cleaned,
-        state
-      );
+
+    indices.push(
+      i
+    );
+
+
+    i++;
+
+
+    if (
+      items.length >= 100
+    ) {
+      break;
     }
   }
 
-  // Inspect nested objects.
-  for (
-    const item of array.slice(0, MAX_ARRAY_ITEMS)
-  ) {
-    if (
-      item &&
-      typeof item === "object"
-    ) {
-      walkValue(
-        item,
-        path,
-        extracted,
-        pending,
-        state
-      );
-    }
-  }
+
+  return {
+    items,
+    indices
+  };
 }
 
 
 // ============================================================
-// STRING PROCESSING
+// LIST ITEM DETECTION
 // ============================================================
 
-function processString(
-  value,
-  path,
-  extracted,
-  pending,
-  state
+function isListItemLike(
+  text
 ) {
-  let text = normalizeText(value);
 
-  if (!text) {
-    return;
-  }
-
-  if (text.length > MAX_TEXT_LENGTH) {
-    text = text.slice(0, MAX_TEXT_LENGTH);
-  }
-
-  // Remove obvious boilerplate.
-  if (isJunkText(text)) {
-    state.removed++;
-    return;
-  }
-
-  // Deduplicate exact repeated text.
-  const fingerprint = normalizeFingerprint(text);
-
-  if (fingerprint) {
-    if (state.seenText.has(fingerprint)) {
-      state.removed++;
-      return;
-    }
-
-    state.seenText.add(fingerprint);
-  }
-
-  // ----------------------------------------------------------
-  // If this string belongs to an explicit object key,
-  // preserve that relationship.
-  // ----------------------------------------------------------
-
-  if (path.length > 0) {
-    const field = normalizeFieldName(
-      path[path.length - 1]
+  const value =
+    normalizeText(
+      text
     );
 
-    if (field) {
-      addExtracted(
-        extracted,
-        field,
-        text,
-        state
-      );
-
-      return;
-    }
-  }
-
-  // ----------------------------------------------------------
-  // Try generic structured text.
-  // Example:
-  //
-  // "Something: Value"
-  // "Something - Value"
-  // ----------------------------------------------------------
-
-  const labeled = parseLabeledText(text);
-
-  if (labeled) {
-    addExtracted(
-      extracted,
-      labeled.field,
-      labeled.data,
-      state
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // Try generic heading + list / block structures.
-  // ----------------------------------------------------------
-
-  const blocks = splitMeaningfulBlocks(text);
-
-  if (blocks.length > 1) {
-    const structured = parseBlocks(blocks);
-
-    if (structured.length > 0) {
-      for (const item of structured) {
-        addExtracted(
-          extracted,
-          item.field,
-          item.data,
-          state
-        );
-      }
-
-      return;
-    }
-  }
-
-  // ----------------------------------------------------------
-  // Recognize values by format.
-  // The Worker does NOT know the business category.
-  // ----------------------------------------------------------
-
-  const detected = detectGenericValue(text);
-
-  if (detected) {
-    addExtracted(
-      extracted,
-      detected.field,
-      detected.data,
-      state
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // Meaningful content that cannot safely be classified.
-  // ----------------------------------------------------------
-
-  if (isMeaningfulText(text)) {
-    pending.push({
-      text,
-      path
-    });
-
-    state.pendingCount++;
-
-    return;
-  }
-
-  state.removed++;
-}
-
-
-// ============================================================
-// GENERIC LABELED TEXT
-// ============================================================
-
-function parseLabeledText(text) {
-  // Only treat a string as a label/value relationship
-  // when the structure is reasonably clear.
-
-  const colonMatch = text.match(
-    /^([^:\n]{1,100})\s*:\s*(.{1,10000})$/s
-  );
-
-  if (colonMatch) {
-    const label = cleanLabel(colonMatch[1]);
-    const value = normalizeText(colonMatch[2]);
-
-    if (
-      isValidGenericLabel(label) &&
-      value
-    ) {
-      return {
-        field: normalizeFieldName(label),
-        data: value
-      };
-    }
-  }
-
-  const dashMatch = text.match(
-    /^([^-–—\n]{1,100})\s*[-–—]\s*(.{1,10000})$/s
-  );
-
-  if (dashMatch) {
-    const label = cleanLabel(dashMatch[1]);
-    const value = normalizeText(dashMatch[2]);
-
-    if (
-      isValidGenericLabel(label) &&
-      value
-    ) {
-      return {
-        field: normalizeFieldName(label),
-        data: value
-      };
-    }
-  }
-
-  return null;
-}
-
-
-// ============================================================
-// GENERIC BLOCK PARSER
-// ============================================================
-
-function parseBlocks(blocks) {
-  const result = [];
-
-  for (let i = 0; i < blocks.length; i++) {
-    const current = blocks[i];
-
-    if (!isLikelyHeading(current)) {
-      continue;
-    }
-
-    const next = blocks[i + 1];
-
-    if (!next) {
-      continue;
-    }
-
-    // Heading followed by a list-like block.
-    if (looksLikeList(next)) {
-      result.push({
-        field: normalizeFieldName(current),
-        data: parseList(next)
-      });
-
-      continue;
-    }
-
-    // Heading followed by meaningful content.
-    if (
-      isMeaningfulText(next) &&
-      next.length <= MAX_TEXT_LENGTH
-    ) {
-      result.push({
-        field: normalizeFieldName(current),
-        data: next
-      });
-    }
-  }
-
-  return result.filter(
-    item =>
-      item.field &&
-      item.data !== undefined &&
-      item.data !== null
-  );
-}
-
-
-// ============================================================
-// GENERIC FORMAT DETECTION
-// ============================================================
-
-function detectGenericValue(text) {
-  // ----------------------------------------------------------
-  // Email
-  // ----------------------------------------------------------
-
-  if (looksLikeEmail(text)) {
-    return {
-      field: "email",
-      data: text
-    };
-  }
-
-  // ----------------------------------------------------------
-  // URL
-  // ----------------------------------------------------------
-
-  if (looksLikeUrl(text)) {
-    return {
-      field: "url",
-      data: text
-    };
-  }
-
-  // ----------------------------------------------------------
-  // Phone
-  // ----------------------------------------------------------
-
-  if (looksLikePhone(text)) {
-    return {
-      field: "phone",
-      data: text
-    };
-  }
-
-  // ----------------------------------------------------------
-  // Date
-  // ----------------------------------------------------------
-
-  if (looksLikeDate(text)) {
-    return {
-      field: "date",
-      data: text
-    };
-  }
-
-  return null;
-}
-
-
-// ============================================================
-// ARRAY CLEANING
-// ============================================================
-
-function cleanArray(array) {
-  const result = [];
-  const fingerprints = new Set();
-
-  for (
-    const item of array.slice(0, MAX_ARRAY_ITEMS)
-  ) {
-    if (item === null || item === undefined) {
-      continue;
-    }
-
-    if (typeof item === "string") {
-      const value = normalizeText(item);
-
-      if (!value || isJunkText(value)) {
-        continue;
-      }
-
-      const fingerprint =
-        normalizeFingerprint(value);
-
-      if (fingerprints.has(fingerprint)) {
-        continue;
-      }
-
-      fingerprints.add(fingerprint);
-      result.push(value);
-
-      continue;
-    }
-
-    if (
-      typeof item === "number" ||
-      typeof item === "boolean"
-    ) {
-      result.push(item);
-      continue;
-    }
-
-    if (
-      typeof item === "object"
-    ) {
-      const cleaned = cleanObject(item);
-
-      if (
-        cleaned &&
-        Object.keys(cleaned).length > 0
-      ) {
-        result.push(cleaned);
-      }
-    }
-  }
-
-  return result;
-}
-
-
-// ============================================================
-// OBJECT CLEANING
-// ============================================================
-
-function cleanObject(object) {
-  const output = {};
-
-  for (
-    const key of Object.keys(object).slice(
-      0,
-      MAX_OBJECT_KEYS
-    )
-  ) {
-    const value = object[key];
-
-    if (
-      typeof value === "string"
-    ) {
-      const cleaned = normalizeText(value);
-
-      if (
-        !cleaned ||
-        isJunkText(cleaned)
-      ) {
-        continue;
-      }
-
-      output[key] =
-        cleaned.slice(0, MAX_TEXT_LENGTH);
-
-      continue;
-    }
-
-    if (
-      Array.isArray(value)
-    ) {
-      const cleanedArray =
-        cleanArray(value);
-
-      if (cleanedArray.length > 0) {
-        output[key] = cleanedArray;
-      }
-
-      continue;
-    }
-
-    if (
-      value &&
-      typeof value === "object"
-    ) {
-      const cleanedObject =
-        cleanObject(value);
-
-      if (
-        cleanedObject &&
-        Object.keys(cleanedObject).length > 0
-      ) {
-        output[key] = cleanedObject;
-      }
-
-      continue;
-    }
-
-    if (
-      typeof value === "number" ||
-      typeof value === "boolean"
-    ) {
-      output[key] = value;
-    }
-  }
-
-  return output;
-}
-
-
-// ============================================================
-// TEXT UTILITIES
-// ============================================================
-
-function normalizeText(value) {
-  return String(value)
-    .replace(/\u00a0/g, " ")
-    .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-
-function cleanString(value) {
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return "";
-  }
-
-  return normalizeText(value);
-}
-
-
-function normalizeFingerprint(text) {
-  return normalizeText(text)
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-// ============================================================
-// FIELD NORMALIZATION
-// ============================================================
-
-function normalizeFieldName(value) {
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return "";
-  }
-
-  let field = String(value)
-    .trim()
-    .toLowerCase();
-
-  field = field
-    .replace(/['"`]/g, "")
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-
-  if (!field) {
-    return "";
-  }
-
-  return field.slice(0, 150);
-}
-
-
-function cleanLabel(value) {
-  return normalizeText(value)
-    .replace(/^[-–—:]+/, "")
-    .replace(/[-–—:]+$/, "")
-    .trim();
-}
-
-
-function isValidGenericLabel(label) {
-  if (!label) {
-    return false;
-  }
-
-  if (label.length < 2) {
-    return false;
-  }
-
-  if (label.length > 100) {
-    return false;
-  }
-
-  if (JUNK_EXACT.has(
-    label.toLowerCase()
-  )) {
-    return false;
-  }
-
-  // Avoid treating a whole sentence as a field name.
-  const words = label.split(/\s+/);
-
-  if (words.length > 12) {
-    return false;
-  }
-
-  return true;
-}
-
-
-// ============================================================
-// JUNK DETECTION
-// ============================================================
-
-function isJunkText(text) {
-  const normalized =
-    normalizeFingerprint(text);
-
-  if (!normalized) {
-    return true;
-  }
-
-  if (JUNK_EXACT.has(normalized)) {
-    return true;
-  }
-
-  for (
-    const pattern of JUNK_PATTERNS
-  ) {
-    if (pattern.test(text.trim())) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-
-// ============================================================
-// MEANINGFUL TEXT DETECTION
-// ============================================================
-
-function isMeaningfulText(text) {
-  const value = normalizeText(text);
 
   if (!value) {
     return false;
   }
 
-  if (value.length < 3) {
-    return false;
-  }
-
-  if (isJunkText(value)) {
-    return false;
-  }
-
-  // Ignore strings consisting almost entirely
-  // of symbols/punctuation.
-  const letters =
-    (value.match(/[A-Za-zÀ-ÖØ-öø-ÿ]/g) || [])
-      .length;
 
   if (
-    letters === 0 &&
-    !/\d/.test(value)
+    /^[-*•]\s+/.test(
+      value
+    )
   ) {
-    return false;
+    return true;
   }
 
-  return true;
+
+  if (
+    /^\d+[.)]\s+/.test(
+      value
+    )
+  ) {
+    return true;
+  }
+
+
+  // Short standalone phrases can form a list.
+  //
+  // But don't classify a sentence as a list item.
+
+  if (
+    value.length <= 100 &&
+    !/[.!?]$/.test(
+      value
+    )
+  ) {
+
+    const words =
+      value.split(
+        /\s+/
+      );
+
+
+    return (
+      words.length <= 10
+    );
+  }
+
+
+  return false;
 }
 
 
@@ -1204,277 +1570,360 @@ function isMeaningfulText(text) {
 // HEADING DETECTION
 // ============================================================
 
-function isLikelyHeading(text) {
-  const value = normalizeText(text);
+function looksLikeHeading(
+  text
+) {
+
+  const value =
+    normalizeText(
+      text
+    );
+
 
   if (!value) {
     return false;
   }
 
-  if (value.length > 180) {
+
+  if (
+    value.length < 2 ||
+    value.length > 160
+  ) {
     return false;
   }
 
-  if (value.endsWith(".")) {
+
+  // A sentence is normally content.
+  if (
+    /[.!?]$/.test(
+      value
+    )
+  ) {
     return false;
   }
 
-  if (value.endsWith("?")) {
+
+  const words =
+    value.split(
+      /\s+/
+    );
+
+
+  if (
+    words.length > 15
+  ) {
     return false;
   }
 
-  if (value.endsWith("!")) {
+
+  // Pure number is not a heading.
+  if (
+    /^\d+[.)]?$/.test(
+      value
+    )
+  ) {
     return false;
   }
 
-  const words = value.split(/\s+/);
-
-  if (words.length > 15) {
-    return false;
-  }
 
   return true;
 }
 
 
 // ============================================================
-// LIST DETECTION
+// SUBSTANTIAL TEXT
 // ============================================================
 
-function looksLikeList(text) {
-  const lines = String(text)
-    .split(/\n/)
-    .map(x => normalizeText(x))
-    .filter(Boolean);
+function isSubstantialText(
+  text
+) {
 
-  if (lines.length < 2) {
+  if (!text) {
     return false;
   }
 
-  let listLines = 0;
 
-  for (const line of lines) {
-    if (
-      /^[-*•]\s+/.test(line) ||
-      /^\d+[.)]\s+/.test(line)
-    ) {
-      listLines++;
-    }
+  if (
+    text.length >= 80
+  ) {
+    return true;
   }
 
-  return listLines >= 2;
-}
 
-
-function parseList(text) {
-  const lines = String(text)
-    .split(/\n/)
-    .map(x => normalizeText(x))
-    .filter(Boolean);
-
-  const result = [];
-
-  for (const line of lines) {
-    const cleaned = line
-      .replace(/^[-*•]\s+/, "")
-      .replace(/^\d+[.)]\s+/, "")
-      .trim();
-
-    if (
-      cleaned &&
-      !isJunkText(cleaned)
-    ) {
-      result.push(cleaned);
-    }
-  }
-
-  return result;
-}
-
-
-// ============================================================
-// BLOCK SPLITTING
-// ============================================================
-
-function splitMeaningfulBlocks(text) {
-  return String(text)
-    .split(/\n{2,}|\n/)
-    .map(x => normalizeText(x))
-    .filter(x => isMeaningfulText(x))
-    .slice(0, 500);
-}
-
-
-// ============================================================
-// GENERIC FORMAT HELPERS
-// ============================================================
-
-function looksLikeEmail(value) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-    value.trim()
-  );
-}
-
-
-function looksLikeUrl(value) {
-  try {
-    const url = new URL(value.trim());
-
-    return (
-      url.protocol === "http:" ||
-      url.protocol === "https:"
+  const words =
+    text.split(
+      /\s+/
     );
-  } catch {
-    return false;
-  }
-}
 
-
-function looksLikePhone(value) {
-  const cleaned = value
-    .replace(/[^\d+]/g, "");
-
-  const digits =
-    cleaned.replace(/\D/g, "");
 
   return (
-    digits.length >= 7 &&
-    digits.length <= 15
+    words.length >= 14
   );
 }
 
 
-function looksLikeDate(value) {
-  const text = value.trim();
+// ============================================================
+// NEXT MEANINGFUL LINE
+// ============================================================
 
-  // ISO-style date
-  if (
-    /^\d{4}-\d{1,2}-\d{1,2}$/.test(text)
+function nextMeaningfulIndex(
+  lines,
+  start,
+  consumed
+) {
+
+  for (
+    let i = start;
+    i < lines.length;
+    i++
   ) {
-    return true;
+
+    if (
+      consumed.has(i)
+    ) {
+      continue;
+    }
+
+
+    if (
+      isMeaningful(
+        lines[i]
+      )
+    ) {
+      return i;
+    }
   }
 
-  // Common numeric date
-  if (
-    /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/.test(text)
-  ) {
-    return true;
-  }
 
-  // Month-name date
-  if (
-    /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(,\s*\d{4})?$/i.test(
+  return -1;
+}
+
+
+// ============================================================
+// REPEATED / NAVIGATION-LIKE CONTENT
+// ============================================================
+
+function isNavigationLike(
+  text
+) {
+
+  const words =
+    normalizeText(
       text
-    )
-  ) {
-    return true;
-  }
+    ).split(
+      /\s+/
+    );
+
+
+  // Very short labels can be legitimate fields,
+  // so this function only rejects obviously structural
+  // punctuation patterns.
+  //
+  // No business vocabulary is used here.
 
   if (
-    /^\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$/i.test(
-      text
-    )
+    words.length > 8
   ) {
-    return true;
+    return false;
   }
+
 
   return false;
 }
 
 
 // ============================================================
-// TYPE HELPERS
+// MEANINGFUL TEXT
 // ============================================================
 
-function isPrimitive(value) {
-  return (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  );
-}
-
-
-function normalizePrimitive(value) {
-  if (typeof value === "string") {
-    return normalizeText(value);
-  }
-
-  return value;
-}
-
-
-// ============================================================
-// EXTRACTED DATA MANAGEMENT
-// ============================================================
-
-function addExtracted(
-  extracted,
-  field,
-  data,
-  state
+function isMeaningful(
+  text
 ) {
-  if (!field) {
-    return;
-  }
 
-  if (
-    data === undefined ||
-    data === null
-  ) {
-    return;
-  }
-
-  if (
-    typeof data === "string" &&
-    !data.trim()
-  ) {
-    return;
-  }
-
-  const existing =
-    extracted.find(
-      item => item.field === field
+  const value =
+    normalizeText(
+      text
     );
 
-  if (!existing) {
-    extracted.push({
-      field,
-      data
-    });
 
-    state.extractedKeys.add(field);
-    return;
+  if (!value) {
+    return false;
   }
 
-  existing.data =
-    mergeValues(
-      existing.data,
-      data
-    );
+
+  if (
+    value.length < 2
+  ) {
+    return false;
+  }
+
+
+  // Pure punctuation.
+  if (
+    /^[^A-Za-z0-9]+$/.test(
+      value
+    )
+  ) {
+    return false;
+  }
+
+
+  return true;
 }
 
 
-function mergeValues(oldValue, newValue) {
+// ============================================================
+// UNIQUE LINES
+// ============================================================
+
+function uniqueTextLines(
+  lines
+) {
+
+  const output = [];
+  const seen = new Set();
+
+
+  for (const line of lines) {
+
+    const value =
+      normalizeText(
+        line
+      );
+
+
+    if (!value) {
+      continue;
+    }
+
+
+    const key =
+      fingerprint(
+        value
+      );
+
+
+    if (
+      seen.has(key)
+    ) {
+      continue;
+    }
+
+
+    seen.add(key);
+
+
+    output.push(
+      value
+    );
+  }
+
+
+  return output;
+}
+
+
+// ============================================================
+// MERGE KNOWLEDGE
+// ============================================================
+
+function mergeKnowledge(
+  items
+) {
+
+  const map =
+    new Map();
+
+
+  for (const item of items) {
+
+    if (!item.field) {
+      continue;
+    }
+
+
+    const existing =
+      map.get(
+        item.field
+      );
+
+
+    if (!existing) {
+
+      map.set(
+        item.field,
+        {
+          field:
+            item.field,
+
+          data:
+            item.data,
+
+          sourceUrls:
+            uniqueStrings(
+              item.sourceUrls || []
+            )
+        }
+      );
+
+
+      continue;
+    }
+
+
+    existing.data =
+      mergeValues(
+        existing.data,
+        item.data
+      );
+
+
+    existing.sourceUrls =
+      uniqueStrings([
+        ...existing.sourceUrls,
+        ...(item.sourceUrls || [])
+      ]);
+  }
+
+
+  return [
+    ...map.values()
+  ];
+}
+
+
+// ============================================================
+// MERGE VALUES
+// ============================================================
+
+function mergeValues(
+  oldValue,
+  newValue
+) {
+
   if (
     Array.isArray(oldValue) &&
     Array.isArray(newValue)
   ) {
-    return uniqueValues([
+
+    return uniqueObjectsAndStrings([
       ...oldValue,
       ...newValue
     ]);
   }
 
+
   if (
     isPlainObject(oldValue) &&
     isPlainObject(newValue)
   ) {
+
     return {
       ...oldValue,
       ...newValue
     };
   }
+
 
   if (
     oldValue === newValue
@@ -1482,336 +1931,237 @@ function mergeValues(oldValue, newValue) {
     return oldValue;
   }
 
+
+  // Don't create nonsense arrays from unrelated scalar
+  // content. Newer structurally identified value wins.
+
   return newValue;
 }
 
 
-function uniqueValues(values) {
-  const output = [];
-  const seen = new Set();
-
-  for (const value of values) {
-    const key =
-      typeof value === "object"
-        ? JSON.stringify(value)
-        : String(value);
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-    output.push(value);
-  }
-
-  return output;
-}
-
-
-function isPlainObject(value) {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value)
-  );
-}
-
-
 // ============================================================
-// DEDUPLICATION
+// SAVE KNOWLEDGE
 // ============================================================
 
-function deduplicateExtracted(items) {
-  const map = new Map();
-
-  for (const item of items) {
-    if (!item.field) {
-      continue;
-    }
-
-    if (!map.has(item.field)) {
-      map.set(item.field, {
-        field: item.field,
-        data: item.data
-      });
-
-      continue;
-    }
-
-    const existing =
-      map.get(item.field);
-
-    existing.data =
-      mergeValues(
-        existing.data,
-        item.data
-      );
-  }
-
-  return [...map.values()];
-}
-
-
-function deduplicatePending(items) {
-  const output = [];
-  const seen = new Set();
-
-  for (const item of items) {
-    const fingerprint =
-      normalizeFingerprint(item.text);
-
-    if (!fingerprint) {
-      continue;
-    }
-
-    if (seen.has(fingerprint)) {
-      continue;
-    }
-
-    seen.add(fingerprint);
-
-    output.push({
-      text: item.text,
-      path: item.path
-    });
-  }
-
-  return output;
-}
-
-
-// ============================================================
-// SUPABASE HELPERS
-// ============================================================
-
-function supabaseHeaders(env) {
-  return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization:
-      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json"
-  };
-}
-
-
-function supabaseUrl(env, table) {
-  return `${env.SUPABASE_URL}/rest/v1/${table}`;
-}
-
-
-// ============================================================
-// SAVE / UPDATE BUSINESS KNOWLEDGE
-// ============================================================
-
-async function upsertKnowledge(
+async function saveKnowledge(
   env,
   applicationId,
-  field,
-  data,
-  sourceUrl
+  item
 ) {
+
+  const field =
+    normalizeFieldName(
+      item.field
+    );
+
+
   if (!field) {
     return false;
   }
 
+
+  const sourceUrls =
+    uniqueStrings(
+      item.sourceUrls || []
+    );
+
+
   const headers =
-    supabaseHeaders(env);
+    supabaseHeaders(
+      env
+    );
+
 
   // ----------------------------------------------------------
-  // Find existing knowledge for:
-  //
-  // application_id + field
+  // Find existing field.
   // ----------------------------------------------------------
 
   const query =
-    `${supabaseUrl(
+    `${tableUrl(
       env,
       "business_knowledge"
-    )}?application_id=eq.${encodeURIComponent(
+    )}` +
+    `?application_id=eq.${encodeURIComponent(
       applicationId
-    )}&field=eq.${encodeURIComponent(
+    )}` +
+    `&field=eq.${encodeURIComponent(
       field
-    )}&select=id,data,source_urls`;
+    )}` +
+    `&select=id,data,source_urls`;
 
-  const findResponse =
-    await fetch(query, {
-      method: "GET",
-      headers
-    });
 
-  if (!findResponse.ok) {
+  const response =
+    await fetch(
+      query,
+      {
+        headers
+      }
+    );
+
+
+  if (!response.ok) {
+
     throw new Error(
-      `Failed to query business_knowledge: ${await findResponse.text()}`
+      `Failed to query business_knowledge: ${await response.text()}`
     );
   }
 
-  const existing =
-    await findResponse.json();
+
+  const existingRows =
+    await response.json();
+
 
   const now =
     new Date().toISOString();
 
-  const existingRow =
-    existing[0];
 
-  if (existingRow) {
+  if (
+    existingRows.length
+  ) {
+
+    const row =
+      existingRows[0];
+
+
     const mergedData =
       mergeValues(
-        existingRow.data,
-        data
+        row.data,
+        item.data
       );
 
-    const sourceUrls =
-      mergeSourceUrls(
-        existingRow.source_urls,
-        sourceUrl
-      );
 
-    const updateResponse =
+    const mergedUrls =
+      uniqueStrings([
+        ...(Array.isArray(
+          row.source_urls
+        )
+          ? row.source_urls
+          : []),
+
+        ...sourceUrls
+      ]);
+
+
+    const update =
       await fetch(
-        `${supabaseUrl(
+        `${tableUrl(
           env,
           "business_knowledge"
-        )}?id=eq.${encodeURIComponent(
-          existingRow.id
+        )}` +
+        `?id=eq.${encodeURIComponent(
+          row.id
         )}`,
         {
           method: "PATCH",
+
           headers: {
             ...headers,
-            Prefer: "return=minimal"
+            Prefer:
+              "return=minimal"
           },
-          body: JSON.stringify({
-            data: mergedData,
-            source_urls: sourceUrls,
-            updated_at: now
-          })
+
+          body:
+            JSON.stringify({
+              data:
+                mergedData,
+
+              source_urls:
+                mergedUrls,
+
+              updated_at:
+                now
+            })
         }
       );
 
-    if (!updateResponse.ok) {
+
+    if (!update.ok) {
+
       throw new Error(
-        `Failed to update business_knowledge: ${await updateResponse.text()}`
+        `Failed to update business_knowledge: ${await update.text()}`
       );
     }
+
 
     return true;
   }
 
+
   // ----------------------------------------------------------
-  // Insert new knowledge
+  // Insert.
   // ----------------------------------------------------------
 
-  const insertResponse =
+  const insert =
     await fetch(
-      supabaseUrl(
+      tableUrl(
         env,
         "business_knowledge"
       ),
       {
         method: "POST",
+
         headers: {
           ...headers,
-          Prefer: "return=minimal"
+          Prefer:
+            "return=minimal"
         },
-        body: JSON.stringify({
-          application_id: applicationId,
-          field,
-          data,
-          source_urls:
-            sourceUrl
-              ? [sourceUrl]
-              : [],
-          created_at: now,
-          updated_at: now
-        })
+
+        body:
+          JSON.stringify({
+
+            application_id:
+              applicationId,
+
+            field,
+
+            data:
+              item.data,
+
+            source_urls:
+              sourceUrls,
+
+            created_at:
+              now,
+
+            updated_at:
+              now
+          })
       }
     );
 
-  if (!insertResponse.ok) {
-    const errorText =
-      await insertResponse.text();
 
-    // Possible race:
-    // another webhook created the same field.
+  if (!insert.ok) {
+
+    const errorText =
+      await insert.text();
+
+
+    // Another webhook may have inserted the same field
+    // between SELECT and INSERT.
     if (
-      insertResponse.status === 409
+      insert.status === 409
     ) {
-      return await upsertKnowledge(
+
+      return await saveKnowledge(
         env,
         applicationId,
-        field,
-        data,
-        sourceUrl
+        item
       );
     }
+
 
     throw new Error(
       `Failed to insert business_knowledge: ${errorText}`
     );
   }
 
+
   return true;
 }
 
 
 // ============================================================
-// PENDING DATA
-// ============================================================
-
-async function savePending(
-  env,
-  applicationId,
-  item,
-  sourceUrl
-) {
-  const pendingData = {
-    text: item.text,
-    path: item.path,
-    reason:
-      "Meaningful content detected but no reliable generic field relationship could be determined."
-  };
-
-  return await upsertKnowledge(
-    env,
-    applicationId,
-    "pending",
-    pendingData,
-    sourceUrl
-  );
-}
-
-
-// ============================================================
-// SOURCE URL MERGING
-// ============================================================
-
-function mergeSourceUrls(
-  existing,
-  sourceUrl
-) {
-  const urls = [];
-
-  if (Array.isArray(existing)) {
-    urls.push(...existing);
-  }
-
-  if (sourceUrl) {
-    urls.push(sourceUrl);
-  }
-
-  return [
-    ...new Set(
-      urls
-        .filter(Boolean)
-        .map(x => String(x))
-    )
-  ];
-}
-
-
-// ============================================================
-// UPDATE BUSINESS_DATA STATUS
+// UPDATE BUSINESS DATA
 // ============================================================
 
 async function updateBusinessDataStatus(
@@ -1820,39 +2170,51 @@ async function updateBusinessDataStatus(
   status,
   errorMessage
 ) {
+
   if (!rowId) {
     return;
   }
 
-  const body = {
-    ai_status: status,
-    ai_error:
-      errorMessage || null,
-    updated_at:
-      new Date().toISOString()
-  };
 
   const response =
     await fetch(
-      `${supabaseUrl(
+      `${tableUrl(
         env,
         "business_data"
-      )}?id=eq.${encodeURIComponent(
+      )}` +
+      `?id=eq.${encodeURIComponent(
         rowId
       )}`,
       {
         method: "PATCH",
+
         headers: {
           ...supabaseHeaders(env),
-          Prefer: "return=minimal"
+          Prefer:
+            "return=minimal"
         },
-        body: JSON.stringify(body)
+
+        body:
+          JSON.stringify({
+
+            ai_status:
+              status,
+
+            ai_error:
+              errorMessage || null,
+
+            updated_at:
+              new Date()
+                .toISOString()
+          })
       }
     );
 
+
   if (!response.ok) {
+
     console.error(
-      "Failed to update business_data status:",
+      "Failed to update business_data:",
       await response.text()
     );
   }
@@ -1860,18 +2222,325 @@ async function updateBusinessDataStatus(
 
 
 // ============================================================
-// JSON RESPONSE
+// GENERIC HELPERS
 // ============================================================
 
-function json(data, status = 200) {
+function normalizeText(
+  value
+) {
+
+  return String(
+    value
+  )
+    .replace(
+      /\u00a0/g,
+      " "
+    )
+    .replace(
+      /\r/g,
+      ""
+    )
+    .replace(
+      /[ \t]+/g,
+      " "
+    )
+    .trim();
+}
+
+
+function cleanString(
+  value
+) {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+
+  return normalizeText(
+    value
+  );
+}
+
+
+function fingerprint(
+  value
+) {
+
+  return normalizeText(
+    value
+  )
+    .toLowerCase()
+    .replace(
+      /\s+/g,
+      " "
+    );
+}
+
+
+function normalizeFieldName(
+  value
+) {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+
+  return String(value)
+    .trim()
+    .toLowerCase()
+    .replace(
+      /['"`]/g,
+      ""
+    )
+    .replace(
+      /&/g,
+      " and "
+    )
+    .replace(
+      /[^a-z0-9]+/g,
+      "_"
+    )
+    .replace(
+      /^_+|_+$/g,
+      ""
+    )
+    .slice(
+      0,
+      150
+    );
+}
+
+
+function looksLikeEmail(
+  value
+) {
+
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    .test(
+      value.trim()
+    );
+}
+
+
+function looksLikeUrl(
+  value
+) {
+
+  try {
+
+    const url =
+      new URL(
+        value.trim()
+      );
+
+
+    return (
+      url.protocol ===
+        "http:" ||
+      url.protocol ===
+        "https:"
+    );
+
+  } catch {
+
+    return false;
+  }
+}
+
+
+function looksLikePhone(
+  value
+) {
+
+  const digits =
+    value.replace(
+      /\D/g,
+      ""
+    );
+
+
+  return (
+    digits.length >= 7 &&
+    digits.length <= 15
+  );
+}
+
+
+function looksLikeDate(
+  value
+) {
+
+  const text =
+    value.trim();
+
+
+  if (
+    /^\d{4}-\d{1,2}-\d{1,2}$/
+      .test(text)
+  ) {
+    return true;
+  }
+
+
+  if (
+    /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/
+      .test(text)
+  ) {
+    return true;
+  }
+
+
+  if (
+    /^\d{1,2}\s+[A-Za-z]+\s+\d{4}$/
+      .test(text)
+  ) {
+    return true;
+  }
+
+
+  if (
+    /^[A-Za-z]+\s+\d{1,2},\s*\d{4}$/
+      .test(text)
+  ) {
+    return true;
+  }
+
+
+  return false;
+}
+
+
+function uniqueStrings(
+  values
+) {
+
+  return [
+    ...new Set(
+      values
+        .filter(Boolean)
+        .map(
+          value =>
+            String(value)
+        )
+    )
+  ];
+}
+
+
+function uniqueObjectsAndStrings(
+  values
+) {
+
+  const output = [];
+  const seen = new Set();
+
+
+  for (const value of values) {
+
+    let key;
+
+
+    if (
+      value &&
+      typeof value === "object"
+    ) {
+
+      try {
+
+        key =
+          JSON.stringify(
+            value
+          );
+
+      } catch {
+
+        key =
+          String(value);
+      }
+
+    } else {
+
+      key =
+        String(value);
+    }
+
+
+    if (
+      seen.has(key)
+    ) {
+      continue;
+    }
+
+
+    seen.add(key);
+    output.push(value);
+  }
+
+
+  return output;
+}
+
+
+function isPlainObject(
+  value
+) {
+
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
+
+function range(
+  start,
+  end
+) {
+
+  const result = [];
+
+
+  for (
+    let i = start;
+    i < end;
+    i++
+  ) {
+
+    result.push(i);
+  }
+
+
+  return result;
+}
+
+
+function json(
+  data,
+  status = 200
+) {
+
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
       status,
+
       headers: {
         "Content-Type":
           "application/json"
       }
     }
   );
-  }
+                  }
