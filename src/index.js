@@ -1,603 +1,1522 @@
 /**
  * Reportli AI — Business Knowledge Worker
  *
- * ARCHITECTURE
+ * AI-FREE / RULE-BASED
  *
- * 1. Supabase inserts into business_data
- * 2. Supabase Database Webhook calls this Worker
- * 3. Webhook only accepts the event
- * 4. Webhook returns immediately
- * 5. Cloudflare Cron runs periodically
- * 6. Cron finds pending business_data rows
- * 7. Cron claims one row
- * 8. Worker sends data to Sarvam
- * 9. Worker saves knowledge to business_knowledge
- * 10. Worker marks business_data as completed
+ * Flow:
  *
- * REQUIRED SECRETS
+ * Scraper Worker
+ *      ↓
+ * business_data
+ *      ↓
+ * Supabase Database Webhook
+ *      ↓
+ * This Worker
+ *      ↓
+ * Rule-based extraction
+ *      ↓
+ * business_knowledge
  *
- * SUPABASE_URL
- * SUPABASE_SERVICE_ROLE_KEY
- * SARVAM_API_KEY
+ * This Worker does NOT:
+ * - scrape websites
+ * - call Sarvam
+ * - call OpenAI
+ * - use any AI
  *
- * Configure the Cron expression in Cloudflare:
- * Every 2 minutes
+ * Required secrets:
+ * - SUPABASE_URL
+ * - SUPABASE_SERVICE_ROLE_KEY
  */
 
-const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
-const SARVAM_MODEL = "sarvam-105b";
-
-// Input / AI limits
-const MAX_TEXT_CHARS = 20000;
-const SARVAM_MAX_TOKENS = 4096;
-const SARVAM_MAX_ATTEMPTS = 2;
-const MIN_ATTEMPT_MS = 5000;
-const MAX_FIELDS_PER_PAGE = 25;
-
-// Cron processing
-const CRON_BUDGET_MS = 90000;
-const SAVE_RESERVE_MS = 5000;
-
-// If a Worker crashes while a row is "processing",
-// Cron can recover it after this amount of time.
-const STALE_PROCESSING_MS = 4 * 60 * 1000;
-
-// IMPORTANT:
-// Process only ONE page per Cron invocation.
-// This keeps Cloudflare subrequests under control.
-const CRON_BATCH = 1;
+const MAX_TEXT_CHARS = 50000;
 
 export default {
-  /**
-   * HTTP handler
-   *
-   * Supabase Database Webhook calls this.
-   *
-   * IMPORTANT:
-   * This handler DOES NOT call Sarvam.
-   * It only accepts the event and leaves the row for Cron.
-   */
   async fetch(request, env, ctx) {
+    // ---------------------------------------------------------
+    // CORS / OPTIONS
+    // ---------------------------------------------------------
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders()
+        headers: corsHeaders(),
       });
     }
 
-    // Health check
+    // ---------------------------------------------------------
+    // HEALTH CHECK
+    // ---------------------------------------------------------
+
     if (request.method === "GET") {
-      return jsonResponse({
+      return json({
         ok: true,
-        service: "reportli-business-knowledge-worker",
-        status: "healthy",
-        architecture: "webhook-queue-cron-processor"
+        worker: "ai-free-business-knowledge-worker",
+        message: "Worker is running",
       });
     }
+
+    // ---------------------------------------------------------
+    // ONLY POST
+    // ---------------------------------------------------------
 
     if (request.method !== "POST") {
-      return jsonResponse(
+      return json(
         {
           ok: false,
-          error: "Method not allowed"
+          error: "Method not allowed",
         },
         405
       );
     }
 
-    // Check secrets
-    const missing = [
-      "SUPABASE_URL",
-      "SUPABASE_SERVICE_ROLE_KEY",
-      "SARVAM_API_KEY"
-    ].filter((key) => !env[key]);
+    // ---------------------------------------------------------
+    // CHECK ENVIRONMENT
+    // ---------------------------------------------------------
 
-    if (missing.length > 0) {
-      console.error("Missing secrets:", missing.join(", "));
+    if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+      console.error("Missing Supabase environment variables");
 
-      return jsonResponse(
+      return json(
         {
           ok: false,
-          error: `Missing secrets: ${missing.join(", ")}`
+          error: "Worker is missing Supabase configuration",
         },
         500
       );
     }
 
-    // Parse webhook JSON
+    // ---------------------------------------------------------
+    // READ WEBHOOK
+    // ---------------------------------------------------------
+
     let payload;
 
     try {
       payload = await request.json();
-    } catch {
-      return jsonResponse(
+    } catch (error) {
+      console.error("Invalid JSON:", error);
+
+      return json(
         {
           ok: false,
-          error: "Invalid JSON"
+          error: "Invalid JSON",
         },
         400
       );
     }
 
-    /**
-     * Supabase Database Webhook sends the row directly.
-     *
-     * Example:
-     *
-     * {
-     *   "id": "...",
-     *   "application_id": "...",
-     *   "field": "page",
-     *   "data": {...},
-     *   "source_url": "...",
-     *   "ai_status": "pending"
-     * }
-     *
-     * We also support wrapped formats just in case.
-     */
-    const record =
-      (payload?.id &&
-        payload?.application_id &&
-        payload?.field &&
-        payload) ||
-      payload?.record ||
-      payload?.new_record ||
-      payload?.data?.record ||
-      payload?.data?.new_record ||
-      null;
+    console.log("Webhook received");
+
+    // ---------------------------------------------------------
+    // EXTRACT BUSINESS_DATA RECORD
+    // ---------------------------------------------------------
+
+    const record = extractRecord(payload);
 
     if (!record) {
-      console.error(
-        "Could not find business_data record. Payload keys:",
-        Object.keys(payload || {})
-      );
+      console.error("Could not find business_data record");
 
-      return jsonResponse(
+      return json(
         {
           ok: false,
-          error: "BUSINESS_DATA_RECORD_NOT_FOUND"
+          error: "Could not find business_data record in webhook payload",
         },
         400
       );
     }
 
-    /**
-     * Detect event type.
-     *
-     * Supabase Database Webhooks normally contain:
-     * INSERT / UPDATE / DELETE
-     *
-     * We only want INSERT.
-     */
-    const eventType = String(
-      payload?.type ||
-        payload?.event ||
-        payload?.event_type ||
-        "INSERT"
-    ).toUpperCase();
+    console.log("business_data id:", record.id);
+    console.log("application_id:", record.application_id);
+    console.log("field:", record.field);
 
-    if (eventType !== "INSERT") {
-      console.log(
-        `Webhook event ${eventType} ignored for ${record.id}`
-      );
+    // ---------------------------------------------------------
+    // ONLY PROCESS PAGE DATA
+    // ---------------------------------------------------------
 
-      return jsonResponse({
-        ok: true,
-        queued: false,
-        skipped: true,
-        reason: `Event type ${eventType} ignored`
-      });
-    }
-
-    // Only process webpage rows
     if (record.field !== "page") {
-      console.log(
-        `Webhook row ${record.id} ignored: field=${record.field}`
-      );
+      console.log("Ignoring non-page field:", record.field);
 
-      return jsonResponse({
+      return json({
         ok: true,
-        queued: false,
-        skipped: true,
-        reason: "Only field=page is processed"
+        ignored: true,
+        reason: "Only page fields are processed",
+        id: record.id,
       });
     }
 
-    if (!record.id) {
-      return jsonResponse(
-        {
-          ok: false,
-          error: "Missing business_data id"
-        },
-        400
-      );
-    }
-
-    console.log(
-      `Webhook received. Queuing business_data ${record.id}`
-    );
-
-    /**
-     * IMPORTANT:
-     *
-     * We do NOT call Sarvam here.
-     * We do NOT use ctx.waitUntil() here.
-     *
-     * The database row remains pending.
-     * Cron will pick it up.
-     */
-
-    return jsonResponse({
-      ok: true,
-      queued: true,
-      id: record.id,
-      message: "Row queued for Cron processing"
-    });
-  },
-
-  /**
-   * Cloudflare Cron handler
-   *
-   * Configure:
-   *
-   * */2 * * * *
-   */
-  async scheduled(event, env, ctx) {
-    console.log("Cron started");
+    // ---------------------------------------------------------
+    // PROCESS
+    // ---------------------------------------------------------
 
     try {
-      await runCron(env);
+      const result = await processBusinessData(record, env);
+
+      return json({
+        ok: true,
+        ...result,
+      });
     } catch (error) {
       console.error(
-        "Cron crashed:",
+        "Processing failed:",
         error?.stack || error?.message || String(error)
       );
-    }
 
-    console.log("Cron finished");
-  }
-};
-
-
-/* =========================================================
-   CRON
-   ========================================================= */
-
-async function runCron(env) {
-  const url =
-    `${env.SUPABASE_URL}/rest/v1/business_data` +
-    `?field=eq.page` +
-    `&select=id,ai_status,updated_at` +
-    `&or=${encodeURIComponent(claimableFilter())}` +
-    `&order=updated_at.asc` +
-    `&limit=${CRON_BATCH}`;
-
-  console.log("Cron querying pending rows");
-
-  const response = await fetch(url, {
-    method: "GET",
-    headers: supabaseHeaders(env)
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-
-    console.error(
-      "Cron query failed:",
-      response.status,
-      text
-    );
-
-    return;
-  }
-
-  const rows = await response.json();
-
-  console.log(
-    `Cron found ${rows.length} claimable row(s)`
-  );
-
-  if (!rows.length) {
-    return;
-  }
-
-  /**
-   * CRON_BATCH = 1
-   *
-   * Process exactly one page per Cron invocation.
-   */
-  for (const row of rows) {
-    await processBusinessData(row.id, env);
-  }
-}
-
-
-/* =========================================================
-   CLAIMABLE ROW FILTER
-   ========================================================= */
-
-function claimableFilter() {
-  const staleBefore = new Date(
-    Date.now() - STALE_PROCESSING_MS
-  ).toISOString();
-
-  return (
-    `(ai_status.eq.pending,` +
-    `ai_status.is.null,` +
-    `and(ai_status.eq.processing,updated_at.lt.${staleBefore}))`
-  );
-}
-
-
-/* =========================================================
-   PROCESS ONE BUSINESS_DATA ROW
-   ========================================================= */
-
-async function processBusinessData(id, env) {
-  const deadline = Date.now() + CRON_BUDGET_MS;
-
-  let claimed = false;
-
-  console.log(
-    `Starting processing for ${id}`
-  );
-
-  try {
-    /**
-     * Get the latest database row.
-     */
-    const row = await getBusinessData(id, env);
-
-    if (!row) {
-      throw new Error(
-        "BUSINESS_DATA_RECORD_NOT_FOUND"
-      );
-    }
-
-    console.log(
-      `Found row ${id}: status=${row.ai_status}`
-    );
-
-    /**
-     * Only process webpage rows.
-     */
-    if (row.field !== "page") {
-      console.log(
-        `Skipping ${id}: field=${row.field}`
-      );
-
-      return;
-    }
-
-    /**
-     * Already completed or permanently failed.
-     */
-    if (
-      row.ai_status === "completed" ||
-      row.ai_status === "failed"
-    ) {
-      console.log(
-        `Skipping ${id}: ai_status=${row.ai_status}`
-      );
-
-      return;
-    }
-
-    /**
-     * Atomically claim the row.
-     *
-     * pending -> processing
-     */
-    claimed = await claimRow(id, env);
-
-    if (!claimed) {
-      console.log(
-        `Could not claim ${id}; another process may already have it`
-      );
-
-      return;
-    }
-
-    console.log(
-      `Claimed ${id}`
-    );
-
-    /**
-     * Convert business_data.data into text.
-     */
-    const inputText = buildInputText(row.data);
-
-    console.log(
-      `Prepared ${inputText.length} characters for Sarvam`
-    );
-
-    /**
-     * Send to Sarvam.
-     */
-    const knowledge = await extractKnowledge(
-      inputText,
-      row.source_url,
-      env,
-      deadline
-    );
-
-    console.log(
-      `Sarvam returned ${knowledge.length} knowledge item(s)`
-    );
-
-    /**
-     * Group and normalize fields.
-     */
-    const grouped = groupKnowledge(knowledge);
-
-    console.log(
-      `Grouped into ${grouped.size} field(s)`
-    );
-
-    /**
-     * Save extracted knowledge.
-     */
-    if (grouped.size > 0) {
-      await saveAll(
-        row.application_id,
-        grouped,
-        row.source_url,
-        env
-      );
-    } else {
-      console.log(
-        `No useful knowledge extracted from ${id}`
-      );
-    }
-
-    /**
-     * Mark source row completed.
-     */
-    await updateStatus(
-      id,
-      "completed",
-      env,
-      null
-    );
-
-    console.log(
-      `SUCCESS: ${id} completed`
-    );
-  } catch (error) {
-    console.error(
-      `Processing failed for ${id}:`,
-      error?.stack || error?.message || String(error)
-    );
-
-    /**
-     * If we didn't claim the row,
-     * don't change its status.
-     */
-    if (!claimed) {
-      return;
-    }
-
-    /**
-     * Cron owns the processing now.
-     *
-     * If Sarvam temporarily fails, keep the row pending
-     * so the next Cron invocation can retry.
-     *
-     * If the error is permanent, mark failed.
-     */
-    try {
-      if (error?.retriable) {
-        await updateStatus(
-          id,
-          "pending",
-          env,
-          `Retry scheduled: ${error.message}`
-        );
-
-        console.log(
-          `Row ${id} returned to pending for retry`
-        );
-      } else {
-        await updateStatus(
-          id,
+      // Try to save the error back to business_data.
+      try {
+        await updateBusinessDataStatus(
+          record.id,
           "failed",
-          env,
-          error?.message || String(error)
+          error?.message || String(error),
+          env
         );
-
-        console.log(
-          `Row ${id} marked failed`
+      } catch (statusError) {
+        console.error(
+          "Could not save error status:",
+          statusError?.message || String(statusError)
         );
       }
-    } catch (statusError) {
-      console.error(
-        "Could not update failure status:",
-        statusError?.message || String(statusError)
+
+      return json(
+        {
+          ok: false,
+          error: error?.message || String(error),
+          id: record.id,
+        },
+        500
       );
     }
+  },
+};
+
+// ============================================================
+// MAIN PROCESSOR
+// ============================================================
+
+async function processBusinessData(record, env) {
+  if (!record.id) {
+    throw new Error("business_data id is missing");
   }
-}
 
+  if (!record.application_id) {
+    throw new Error("application_id is missing");
+  }
 
-/* =========================================================
-   GET BUSINESS_DATA
-   ========================================================= */
+  // ----------------------------------------------------------
+  // MARK AS PROCESSING
+  // ----------------------------------------------------------
 
-async function getBusinessData(id, env) {
-  const url =
-    `${env.SUPABASE_URL}/rest/v1/business_data` +
-    `?id=eq.${encodeURIComponent(id)}` +
-    `&select=id,application_id,field,data,source_url,ai_status,ai_error,updated_at` +
-    `&limit=1`;
+  await updateBusinessDataStatus(
+    record.id,
+    "processing",
+    null,
+    env
+  );
 
-  const response = await fetch(url, {
-    method: "GET",
-    headers: supabaseHeaders(env)
+  // ----------------------------------------------------------
+  // CONVERT RAW DATA INTO TEXT
+  // ----------------------------------------------------------
+
+  const rawText = extractAllText(record.data);
+
+  if (!rawText.trim()) {
+    throw new Error("business_data.data contains no usable text");
+  }
+
+  console.log("Raw text length:", rawText.length);
+
+  // ----------------------------------------------------------
+  // EXTRACT RULE-BASED KNOWLEDGE
+  // ----------------------------------------------------------
+
+  const extracted = extractKnowledge({
+    data: record.data,
+    text: rawText,
+    sourceUrl: record.source_url || null,
   });
 
-  if (!response.ok) {
-    throw new Error(
-      `GET business_data failed: ` +
-      `${response.status} ${await response.text()}`
-    );
+  console.log(
+    "Extracted fields:",
+    Object.keys(extracted)
+  );
+
+  // ----------------------------------------------------------
+  // SAVE TO business_knowledge
+  // ----------------------------------------------------------
+
+  const fields = Object.entries(extracted);
+
+  let savedCount = 0;
+
+  for (const [field, data] of fields) {
+    if (
+      data === null ||
+      data === undefined ||
+      data === "" ||
+      (Array.isArray(data) && data.length === 0)
+    ) {
+      continue;
+    }
+
+    await saveKnowledge({
+      applicationId: record.application_id,
+      field,
+      data,
+      sourceUrl: record.source_url || null,
+      env,
+    });
+
+    savedCount++;
   }
 
-  const rows = await response.json();
+  // ----------------------------------------------------------
+  // MARK COMPLETED
+  // ----------------------------------------------------------
 
-  return rows?.[0] || null;
+  await updateBusinessDataStatus(
+    record.id,
+    "completed",
+    null,
+    env
+  );
+
+  return {
+    processed: true,
+    id: record.id,
+    application_id: record.application_id,
+    fields_found: fields.length,
+    fields_saved: savedCount,
+  };
 }
 
+// ============================================================
+// WEBHOOK RECORD EXTRACTION
+// ============================================================
 
-/* =========================================================
-   CLAIM ROW
-   ========================================================= */
+function extractRecord(payload) {
+  // Supabase Database Webhook normally sends the row directly.
 
-async function claimRow(id, env) {
-  const url =
-    `${env.SUPABASE_URL}/rest/v1/business_data` +
-    `?id=eq.${encodeURIComponent(id)}` +
-    `&or=${encodeURIComponent(claimableFilter())}`;
-
-  const response = await fetch(url, {
-    method: "PATCH",
-
-    headers: {
-      ...supabaseHeaders(env),
-      "Prefer": "return=representation"
-    },
-
-    body: JSON.stringify({
-      ai_status: "processing",
-      ai_error: null,
-      updated_at: new Date().toISOString()
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Could not claim row: ` +
-      `${response.status} ${await response.text()}`
-    );
+  if (
+    payload &&
+    payload.id &&
+    payload.application_id &&
+    payload.field
+  ) {
+    return payload;
   }
 
-  const rows = await response.json();
+  // Support common wrapped payload formats too.
 
-  return (
-    Array.isArray(rows) &&
-    rows.length > 0
+  if (
+    payload?.record?.id &&
+    payload?.record?.application_id
+  ) {
+    return payload.record;
+  }
+
+  if (
+    payload?.new_record?.id &&
+    payload?.new_record?.application_id
+  ) {
+    return payload.new_record;
+  }
+
+  if (
+    payload?.data?.record?.id &&
+    payload?.data?.record?.application_id
+  ) {
+    return payload.data.record;
+  }
+
+  if (
+    payload?.data?.new_record?.id &&
+    payload?.data?.new_record?.application_id
+  ) {
+    return payload.data.new_record;
+  }
+
+  return null;
+}
+
+// ============================================================
+// TEXT EXTRACTION
+// ============================================================
+
+function extractAllText(value, depth = 0) {
+  if (depth > 10) {
+    return "";
+  }
+
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => extractAllText(item, depth + 1))
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (typeof value === "object") {
+    return Object.entries(value)
+      .map(([key, val]) => {
+        const valueText = extractAllText(val, depth + 1);
+
+        if (!valueText) {
+          return "";
+        }
+
+        return `${key}: ${valueText}`;
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return "";
+}
+
+// ============================================================
+// MAIN RULE ENGINE
+// ============================================================
+
+function extractKnowledge({ data, text, sourceUrl }) {
+  const result = {};
+
+  const cleanText = cleanTextValue(text);
+
+  // ----------------------------------------------------------
+  // 1. BUSINESS NAME
+  // ----------------------------------------------------------
+
+  const businessName = extractBusinessName(data, cleanText);
+
+  if (businessName) {
+    result.business_name = businessName;
+  }
+
+  // ----------------------------------------------------------
+  // 2. DESCRIPTION
+  // ----------------------------------------------------------
+
+  const description = extractDescription(data, cleanText);
+
+  if (description) {
+    result.description = description;
+  }
+
+  // ----------------------------------------------------------
+  // 3. LOCATION
+  // ----------------------------------------------------------
+
+  const location = extractLocation(data, cleanText);
+
+  if (location) {
+    result.location = location;
+  }
+
+  // ----------------------------------------------------------
+  // 4. PHONE NUMBERS
+  // ----------------------------------------------------------
+
+  const phones = extractPhones(data, cleanText);
+
+  if (phones.length > 0) {
+    result.phone_numbers = phones;
+  }
+
+  // ----------------------------------------------------------
+  // 5. EMAILS
+  // ----------------------------------------------------------
+
+  const emails = extractEmails(data, cleanText);
+
+  if (emails.length > 0) {
+    result.emails = emails;
+  }
+
+  // ----------------------------------------------------------
+  // 6. ADDRESS
+  // ----------------------------------------------------------
+
+  const address = extractAddress(data, cleanText);
+
+  if (address) {
+    result.address = address;
+  }
+
+  // ----------------------------------------------------------
+  // 7. SERVICES
+  // ----------------------------------------------------------
+
+  const services = extractServices(data, cleanText);
+
+  if (services.length > 0) {
+    result.services = services;
+  }
+
+  // ----------------------------------------------------------
+  // 8. BOOKING URL
+  // ----------------------------------------------------------
+
+  const bookingUrl = extractBookingUrl(data, cleanText);
+
+  if (bookingUrl) {
+    result.booking_url = bookingUrl;
+  }
+
+  // ----------------------------------------------------------
+  // 9. WHATSAPP
+  // ----------------------------------------------------------
+
+  const whatsapp = extractWhatsApp(data, cleanText);
+
+  if (whatsapp) {
+    result.whatsapp = whatsapp;
+  }
+
+  // ----------------------------------------------------------
+  // 10. SOCIAL LINKS
+  // ----------------------------------------------------------
+
+  const socialLinks = extractSocialLinks(data, cleanText);
+
+  if (Object.keys(socialLinks).length > 0) {
+    result.social_links = socialLinks;
+  }
+
+  // ----------------------------------------------------------
+  // 11. EXPERIENCE
+  // ----------------------------------------------------------
+
+  const experience = extractExperience(cleanText);
+
+  if (experience) {
+    result.experience = experience;
+  }
+
+  // ----------------------------------------------------------
+  // 12. CUSTOMER COUNT
+  // ----------------------------------------------------------
+
+  const customers = extractMetric(
+    cleanText,
+    [
+      "customers",
+      "clients",
+      "guests",
+      "members",
+    ]
+  );
+
+  if (customers !== null) {
+    result.customers = customers;
+  }
+
+  // ----------------------------------------------------------
+  // 13. STAFF / STYLIST COUNT
+  // ----------------------------------------------------------
+
+  const stylists = extractMetric(
+    cleanText,
+    [
+      "stylists",
+      "staff",
+      "employees",
+      "therapists",
+      "doctors",
+      "professionals",
+    ]
+  );
+
+  if (stylists !== null) {
+    result.stylists = stylists;
+  }
+
+  // ----------------------------------------------------------
+  // 14. PAYMENT METHODS
+  // ----------------------------------------------------------
+
+  const paymentMethods = extractPaymentMethods(cleanText);
+
+  if (paymentMethods.length > 0) {
+    result.payment_methods = paymentMethods;
+  }
+
+  // ----------------------------------------------------------
+  // 15. OPENING HOURS
+  // ----------------------------------------------------------
+
+  const openingHours = extractOpeningHours(cleanText);
+
+  if (openingHours.length > 0) {
+    result.opening_hours = openingHours;
+  }
+
+  // ----------------------------------------------------------
+  // 16. SOURCE URL
+  // ----------------------------------------------------------
+
+  if (sourceUrl) {
+    result.source_url = sourceUrl;
+  }
+
+  return result;
+}
+
+// ============================================================
+// BUSINESS NAME
+// ============================================================
+
+function extractBusinessName(data, text) {
+  // First use explicitly structured fields if the scraper
+  // already provided them.
+
+  const direct = findObjectValue(
+    data,
+    [
+      "business_name",
+      "businessName",
+      "company_name",
+      "companyName",
+      "organization_name",
+      "organizationName",
+      "hotel_name",
+      "hotelName",
+      "brand_name",
+      "brandName",
+    ]
+  );
+
+  if (direct) {
+    return cleanBusinessName(String(direct));
+  }
+
+  // Look for title.
+
+  const title = findObjectValue(
+    data,
+    [
+      "title",
+      "page_title",
+      "pageTitle",
+    ]
+  );
+
+  if (title) {
+    const name = cleanBusinessName(String(title));
+
+    if (isUsableBusinessName(name)) {
+      return name;
+    }
+  }
+
+  // Look for common text patterns.
+
+  const lines = getLines(text);
+
+  for (const line of lines.slice(0, 20)) {
+    const lower = line.toLowerCase();
+
+    if (
+      lower.includes("welcome to ")
+    ) {
+      const value = line
+        .replace(/^welcome\s+to\s+/i, "")
+        .trim();
+
+      if (isUsableBusinessName(value)) {
+        return cleanBusinessName(value);
+      }
+    }
+  }
+
+  // First line containing a likely business name.
+
+  for (const line of lines.slice(0, 10)) {
+    if (isUsableBusinessName(line)) {
+      return cleanBusinessName(line);
+    }
+  }
+
+  return null;
+}
+
+function cleanBusinessName(value) {
+  let result = value
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Remove common page-title suffixes.
+
+  result = result
+    .replace(/\s*[|•·]\s*(home|homepage)\s*$/i, "")
+    .replace(/\s*[-|•·]\s*(home|homepage)\s*$/i, "")
+    .trim();
+
+  return result;
+}
+
+function isUsableBusinessName(value) {
+  if (!value) return false;
+
+  const lower = value.toLowerCase();
+
+  const blocked = [
+    "home",
+    "welcome",
+    "contact us",
+    "about us",
+    "services",
+    "our services",
+    "book appointment",
+    "gallery",
+    "menu",
+    "navigation",
+  ];
+
+  if (blocked.includes(lower)) {
+    return false;
+  }
+
+  if (value.length < 3) {
+    return false;
+  }
+
+  if (value.length > 150) {
+    return false;
+  }
+
+  return true;
+}
+
+// ============================================================
+// DESCRIPTION
+// ============================================================
+
+function extractDescription(data, text) {
+  const direct = findObjectValue(
+    data,
+    [
+      "description",
+      "about",
+      "about_us",
+      "aboutUs",
+      "business_description",
+      "businessDescription",
+    ]
+  );
+
+  if (direct && typeof direct === "string") {
+    return cleanTextValue(direct);
+  }
+
+  const lines = getLines(text);
+
+  const headingIndex = findHeadingIndex(lines, [
+    "about",
+    "about us",
+    "about-us",
+    "welcome",
+    "welcome to",
+  ]);
+
+  if (headingIndex >= 0) {
+    const collected = [];
+
+    for (
+      let i = headingIndex + 1;
+      i < Math.min(lines.length, headingIndex + 8);
+      i++
+    ) {
+      const line = lines[i];
+
+      if (isSectionHeading(line)) {
+        break;
+      }
+
+      if (line.length >= 30) {
+        collected.push(line);
+      }
+    }
+
+    if (collected.length > 0) {
+      return collected.join(" ").slice(0, 2000);
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// LOCATION
+// ============================================================
+
+function extractLocation(data, text) {
+  const direct = findObjectValue(
+    data,
+    [
+      "location",
+      "city",
+      "town",
+      "area",
+      "addressLocality",
+    ]
+  );
+
+  if (direct) {
+    return String(direct).trim();
+  }
+
+  // Common title format:
+  // Business Name | Pollachi
+
+  const firstLines = getLines(text).slice(0, 5);
+
+  for (const line of firstLines) {
+    const parts = line.split("|");
+
+    if (parts.length >= 2) {
+      const last = parts[parts.length - 1].trim();
+
+      if (
+        last.length >= 2 &&
+        last.length <= 80 &&
+        !isGenericPageWord(last)
+      ) {
+        return last;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// PHONES
+// ============================================================
+
+function extractPhones(data, text) {
+  const values = [];
+
+  collectObjectValues(
+    data,
+    [
+      "phone",
+      "phone_number",
+      "phoneNumber",
+      "telephone",
+      "mobile",
+      "mobile_number",
+      "mobileNumber",
+      "whatsapp",
+    ],
+    values
+  );
+
+  const textMatches = text.match(
+    /(?:\+?\d[\d\s().-]{7,}\d)/g
+  ) || [];
+
+  values.push(...textMatches);
+
+  return unique(
+    values
+      .map(normalizePhone)
+      .filter((phone) => phone)
   );
 }
 
+function normalizePhone(value) {
+  const original = String(value).trim();
 
-/* =========================================================
-   UPDATE BUSINESS_DATA STATUS
-   ========================================================= */
+  const digits = original.replace(/\D/g, "");
 
-async function updateStatus(
+  if (digits.length < 8 || digits.length > 15) {
+    return null;
+  }
+
+  return original;
+}
+
+// ============================================================
+// EMAILS
+// ============================================================
+
+function extractEmails(data, text) {
+  const values = [];
+
+  collectObjectValues(
+    data,
+    [
+      "email",
+      "emails",
+      "mail",
+      "contact_email",
+      "contactEmail",
+    ],
+    values
+  );
+
+  const matches =
+    text.match(
+      /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
+    ) || [];
+
+  values.push(...matches);
+
+  return unique(
+    values
+      .map((value) => String(value).trim().toLowerCase())
+      .filter((value) => value.includes("@"))
+  );
+}
+
+// ============================================================
+// ADDRESS
+// ============================================================
+
+function extractAddress(data, text) {
+  const direct = findObjectValue(
+    data,
+    [
+      "address",
+      "full_address",
+      "fullAddress",
+      "street_address",
+      "streetAddress",
+    ]
+  );
+
+  if (typeof direct === "string") {
+    return cleanTextValue(direct);
+  }
+
+  if (direct && typeof direct === "object") {
+    return direct;
+  }
+
+  const lines = getLines(text);
+
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+
+    if (
+      lower.includes("road") ||
+      lower.includes("street") ||
+      lower.includes("avenue") ||
+      lower.includes("nagar") ||
+      lower.includes("p.o") ||
+      lower.includes("pin") ||
+      lower.includes("postal")
+    ) {
+      if (line.length >= 15 && line.length <= 300) {
+        return line;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// SERVICES
+// ============================================================
+
+function extractServices(data, text) {
+  const values = [];
+
+  collectObjectValues(
+    data,
+    [
+      "services",
+      "service",
+      "treatments",
+      "treatment",
+      "facilities",
+      "offers",
+    ],
+    values
+  );
+
+  const structured = flattenToStrings(values);
+
+  if (structured.length > 0) {
+    return cleanList(structured);
+  }
+
+  // Find a "Services" section in plain text.
+
+  const lines = getLines(text);
+
+  const headingIndex = findHeadingIndex(lines, [
+    "services",
+    "our services",
+    "services we offer",
+    "what we offer",
+    "treatments",
+    "facilities",
+  ]);
+
+  if (headingIndex < 0) {
+    return [];
+  }
+
+  const results = [];
+
+  for (
+    let i = headingIndex + 1;
+    i < Math.min(lines.length, headingIndex + 20);
+    i++
+  ) {
+    const line = lines[i];
+
+    if (isSectionHeading(line)) {
+      break;
+    }
+
+    if (
+      line.length >= 2 &&
+      line.length <= 100 &&
+      !isGenericPageWord(line)
+    ) {
+      results.push(line);
+    }
+  }
+
+  return cleanList(results);
+}
+
+// ============================================================
+// BOOKING URL
+// ============================================================
+
+function extractBookingUrl(data, text) {
+  const urls = extractUrlsFromObject(data);
+
+  for (const url of urls) {
+    if (
+      /book|appointment|reservation|reserve|schedule/i.test(
+        url
+      )
+    ) {
+      return url;
+    }
+  }
+
+  const textUrls = extractUrls(text);
+
+  for (const url of textUrls) {
+    if (
+      /book|appointment|reservation|reserve|schedule/i.test(
+        url
+      )
+    ) {
+      return url;
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// WHATSAPP
+// ============================================================
+
+function extractWhatsApp(data, text) {
+  const urls = extractUrlsFromObject(data);
+
+  for (const url of urls) {
+    if (
+      /wa\.me|whatsapp\.com/i.test(url)
+    ) {
+      return url;
+    }
+  }
+
+  const textUrls = extractUrls(text);
+
+  for (const url of textUrls) {
+    if (
+      /wa\.me|whatsapp\.com/i.test(url)
+    ) {
+      return url;
+    }
+  }
+
+  if (/book on whatsapp/i.test(text)) {
+    const phones = extractPhones(data, text);
+
+    if (phones.length > 0) {
+      return phones[0];
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// SOCIAL LINKS
+// ============================================================
+
+function extractSocialLinks(data, text) {
+  const urls = unique([
+    ...extractUrlsFromObject(data),
+    ...extractUrls(text),
+  ]);
+
+  const result = {};
+
+  for (const url of urls) {
+    const lower = url.toLowerCase();
+
+    if (lower.includes("instagram.com")) {
+      result.instagram = url;
+    } else if (lower.includes("facebook.com")) {
+      result.facebook = url;
+    } else if (
+      lower.includes("linkedin.com")
+    ) {
+      result.linkedin = url;
+    } else if (
+      lower.includes("youtube.com") ||
+      lower.includes("youtu.be")
+    ) {
+      result.youtube = url;
+    } else if (
+      lower.includes("twitter.com") ||
+      lower.includes("x.com")
+    ) {
+      result.twitter = url;
+    } else if (
+      lower.includes("tiktok.com")
+    ) {
+      result.tiktok = url;
+    }
+  }
+
+  return result;
+}
+
+// ============================================================
+// EXPERIENCE
+// ============================================================
+
+function extractExperience(text) {
+  const patterns = [
+    /(\d+)\s*\+?\s*years?\s+(?:of\s+)?(?:experience|expertise)/i,
+    /(\d+)\s*\+?\s*years?\s+(?:in|of)/i,
+    /(?:over|more than)\s+(\d+)\s+years?/i,
+    /(\d+)\s*years?\s+(?:traditional|rich)\s+experience/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+
+    if (match) {
+      return `${match[1]} years`;
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// NUMBER METRICS
+// ============================================================
+
+function extractMetric(text, keywords) {
+  for (const keyword of keywords) {
+    const escaped = escapeRegex(keyword);
+
+    const patterns = [
+      new RegExp(
+        `(\\d[\\d,]*)\\s*\\+?\\s*${escaped}`,
+        "i"
+      ),
+      new RegExp(
+        `${escaped}\\s*[:\\-]?\\s*(\\d[\\d,]*)`,
+        "i"
+      ),
+    ];
+
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+
+      if (match) {
+        const number = Number(
+          match[1].replace(/,/g, "")
+        );
+
+        if (Number.isFinite(number)) {
+          return number;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// PAYMENT METHODS
+// ============================================================
+
+function extractPaymentMethods(text) {
+  const methods = [];
+
+  const known = [
+    ["credit card", "credit card"],
+    ["debit card", "debit card"],
+    ["net banking", "net banking"],
+    ["upi", "UPI"],
+    ["paypal", "PayPal"],
+    ["cash", "cash"],
+  ];
+
+  for (const [search, value] of known) {
+    if (text.toLowerCase().includes(search)) {
+      methods.push(value);
+    }
+  }
+
+  return unique(methods);
+}
+
+// ============================================================
+// OPENING HOURS
+// ============================================================
+
+function extractOpeningHours(text) {
+  const lines = getLines(text);
+  const results = [];
+
+  for (const line of lines) {
+    if (
+      /\b(mon|monday|tue|tuesday|wed|wednesday|thu|thursday|fri|friday|sat|saturday|sun|sunday)\b/i.test(
+        line
+      ) &&
+      /\d{1,2}[:.]\d{2}/.test(line)
+    ) {
+      results.push(line);
+    }
+  }
+
+  return unique(results);
+}
+
+// ============================================================
+// OBJECT HELPERS
+// ============================================================
+
+function findObjectValue(object, keys) {
+  const wanted = new Set(
+    keys.map((key) => key.toLowerCase())
+  );
+
+  function search(value, depth = 0) {
+    if (depth > 10 || value === null || value === undefined) {
+      return null;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = search(item, depth + 1);
+
+        if (found !== null && found !== undefined) {
+          return found;
+        }
+      }
+
+      return null;
+    }
+
+    if (typeof value !== "object") {
+      return null;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (
+        wanted.has(key.toLowerCase()) &&
+        child !== null &&
+        child !== undefined &&
+        child !== ""
+      ) {
+        return child;
+      }
+    }
+
+    for (const child of Object.values(value)) {
+      const found = search(child, depth + 1);
+
+      if (found !== null && found !== undefined) {
+        return found;
+      }
+    }
+
+    return null;
+  }
+
+  return search(object);
+}
+
+function collectObjectValues(object, keys, output) {
+  const wanted = new Set(
+    keys.map((key) => key.toLowerCase())
+  );
+
+  function walk(value, depth = 0) {
+    if (depth > 10 || value === null || value === undefined) {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        walk(item, depth + 1);
+      }
+
+      return;
+    }
+
+    if (typeof value !== "object") {
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (wanted.has(key.toLowerCase())) {
+        output.push(child);
+      }
+
+      walk(child, depth + 1);
+    }
+  }
+
+  walk(object);
+}
+
+function flattenToStrings(value) {
+  const result = [];
+
+  function walk(item, depth = 0) {
+    if (depth > 10 || item === null || item === undefined) {
+      return;
+    }
+
+    if (typeof item === "string") {
+      const value = cleanTextValue(item);
+
+      if (value) {
+        result.push(value);
+      }
+
+      return;
+    }
+
+    if (
+      typeof item === "number" ||
+      typeof item === "boolean"
+    ) {
+      result.push(String(item));
+      return;
+    }
+
+    if (Array.isArray(item)) {
+      for (const child of item) {
+        walk(child, depth + 1);
+      }
+
+      return;
+    }
+
+    if (typeof item === "object") {
+      for (const child of Object.values(item)) {
+        walk(child, depth + 1);
+      }
+    }
+  }
+
+  walk(value);
+
+  return result;
+}
+
+// ============================================================
+// URL HELPERS
+// ============================================================
+
+function extractUrls(text) {
+  const matches =
+    text.match(
+      /https?:\/\/[^\s"'<>]+/gi
+    ) || [];
+
+  return unique(
+    matches.map((url) =>
+      url.replace(/[),.;]+$/, "")
+    )
+  );
+}
+
+function extractUrlsFromObject(data) {
+  const text = extractAllText(data);
+
+  return extractUrls(text);
+}
+
+// ============================================================
+// TEXT HELPERS
+// ============================================================
+
+function cleanTextValue(value) {
+  return String(value || "")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n")
+    .trim()
+    .slice(0, MAX_TEXT_CHARS);
+}
+
+function getLines(text) {
+  return String(text)
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/\s+/g, " ")
+        .trim()
+    )
+    .filter(Boolean);
+}
+
+function findHeadingIndex(lines, headings) {
+  const normalized = headings.map((value) =>
+    value.toLowerCase()
+  );
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].toLowerCase().trim();
+
+    if (normalized.includes(line)) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+function isSectionHeading(line) {
+  const value = line.toLowerCase().trim();
+
+  const headings = [
+    "home",
+    "about",
+    "about us",
+    "services",
+    "our services",
+    "contact",
+    "contact us",
+    "gallery",
+    "facilities",
+    "location",
+    "menu",
+    "book appointment",
+    "booking",
+    "offers",
+    "events",
+    "rooms",
+    "dining",
+  ];
+
+  return headings.includes(value);
+}
+
+function isGenericPageWord(value) {
+  const lower = value.toLowerCase().trim();
+
+  return [
+    "home",
+    "about",
+    "about us",
+    "contact",
+    "contact us",
+    "services",
+    "our services",
+    "gallery",
+    "menu",
+    "booking",
+    "book appointment",
+    "login",
+    "register",
+  ].includes(lower);
+}
+
+function cleanList(values) {
+  return unique(
+    values
+      .map((value) =>
+        String(value)
+          .replace(/^[•\-–—*]+\s*/, "")
+          .replace(/\s+/g, " ")
+          .trim()
+      )
+      .filter((value) => {
+        return (
+          value.length >= 2 &&
+          value.length <= 150 &&
+          !isGenericPageWord(value)
+        );
+      })
+  );
+}
+
+function unique(values) {
+  const seen = new Set();
+  const result = [];
+
+  for (const value of values) {
+    const key = String(value).toLowerCase().trim();
+
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(value);
+  }
+
+  return result;
+}
+
+function escapeRegex(value) {
+  return String(value).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
+}
+
+// ============================================================
+// SUPABASE
+// ============================================================
+
+function supabaseHeaders(env) {
+  return {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+}
+
+async function updateBusinessDataStatus(
   id,
   status,
-  env,
-  errorMessage
+  errorMessage,
+  env
 ) {
   const url =
     `${env.SUPABASE_URL}/rest/v1/business_data` +
@@ -605,1215 +1524,236 @@ async function updateStatus(
 
   const response = await fetch(url, {
     method: "PATCH",
-
     headers: {
       ...supabaseHeaders(env),
-      "Prefer": "return=minimal"
+      Prefer: "return=minimal",
     },
-
     body: JSON.stringify({
       ai_status: status,
-
-      ai_error: errorMessage
-        ? String(errorMessage).slice(0, 2000)
-        : null,
-
-      updated_at: new Date().toISOString()
-    })
+      ai_error: errorMessage || null,
+      updated_at: new Date().toISOString(),
+    }),
   });
 
   if (!response.ok) {
+    const body = await response.text();
+
     throw new Error(
-      `Failed to update status: ` +
-      `${response.status} ${await response.text()}`
+      `Failed to update business_data status: ${response.status} ${body}`
     );
   }
-
-  console.log(
-    `business_data ${id} -> ${status}`
-  );
 }
 
+// ============================================================
+// SAVE KNOWLEDGE
+// ============================================================
 
-/* =========================================================
-   BUILD AI INPUT
-   ========================================================= */
-
-function buildInputText(data) {
-  if (
-    data === null ||
-    data === undefined
-  ) {
-    throw new Error(
-      "business_data.data is empty"
-    );
-  }
-
-  let text =
-    typeof data === "string"
-      ? data
-      : JSON.stringify(data);
-
-  text = text
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
-  if (!text) {
-    throw new Error(
-      "business_data.data contains no text"
-    );
-  }
-
-  return text.slice(
-    0,
-    MAX_TEXT_CHARS
-  );
-}
-
-
-/* =========================================================
-   SARVAM EXTRACTION
-   ========================================================= */
-
-async function extractKnowledge(
-  inputText,
+async function saveKnowledge({
+  applicationId,
+  field,
+  data,
   sourceUrl,
   env,
-  deadline
-) {
-  const prompt = `Extract only the important business facts from this webpage text.
-
-Return ONLY a JSON object. No markdown. No explanation.
-
-Format:
-{"knowledge":[{"field":"short_snake_case_name","data":"string, array, or object"}]}
-
-Useful fields:
-business_name
-business_type
-description
-services
-products
-pricing
-phone
-email
-address
-hours
-team
-policies
-faqs
-social_media
-
-Rules:
-- Use only facts present in the text.
-- Never invent anything.
-- Ignore menus, navigation, footers, cookie notices, placeholders and demo content.
-- One item per field.
-- Use an array for lists.
-- Use an object for structured data such as address.
-- Keep values concise.
-- If nothing useful is found, return {"knowledge":[]}.
-
-SOURCE URL:
-${sourceUrl || "unknown"}
-
-WEBPAGE TEXT:
-${inputText}`;
-
-  let lastError = null;
-
-  for (
-    let attempt = 1;
-    attempt <= SARVAM_MAX_ATTEMPTS;
-    attempt++
-  ) {
-    /**
-     * Keep enough time available for Supabase saving.
-     */
-    const remaining =
-      deadline -
-      Date.now() -
-      SAVE_RESERVE_MS;
-
-    if (remaining < MIN_ATTEMPT_MS) {
-      throw (
-        lastError ||
-        makeError(
-          "Not enough time left to call Sarvam",
-          true
-        )
-      );
-    }
-
-    console.log(
-      `Sarvam attempt ${attempt} ` +
-      `(timeout ${Math.round(remaining / 1000)}s)`
-    );
-
-    try {
-      return await callSarvamOnce(
-        prompt,
-        env,
-        remaining
-      );
-    } catch (error) {
-      lastError = error;
-
-      console.error(
-        `Sarvam attempt ${attempt} failed:`,
-        error?.message || String(error)
-      );
-
-      if (!error?.retriable) {
-        throw error;
-      }
-
-      if (
-        attempt < SARVAM_MAX_ATTEMPTS
-      ) {
-        await sleep(
-          1000 * attempt
-        );
-      }
-    }
-  }
-
-  throw (
-    lastError ||
-    makeError(
-      "Sarvam extraction failed",
-      true
-    )
-  );
-}
-
-
-/* =========================================================
-   SINGLE SARVAM REQUEST
-   ========================================================= */
-
-async function callSarvamOnce(
-  prompt,
-  env,
-  timeoutMs
-) {
-  const controller =
-    new AbortController();
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs
-  );
-
-  try {
-    let response;
-    let responseText;
-
-    try {
-      response = await fetch(
-        SARVAM_URL,
-        {
-          method: "POST",
-
-          signal:
-            controller.signal,
-
-          headers: {
-            "Content-Type":
-              "application/json",
-
-            "api-subscription-key":
-              env.SARVAM_API_KEY
-          },
-
-          body: JSON.stringify({
-            model: SARVAM_MODEL,
-
-            messages: [
-              {
-                role: "user",
-                content: prompt
-              }
-            ],
-
-            temperature: 0,
-
-            max_tokens:
-              SARVAM_MAX_TOKENS
-          })
-        }
-      );
-
-      responseText =
-        await response.text();
-    } catch (error) {
-      if (
-        error?.name ===
-        "AbortError"
-      ) {
-        throw makeError(
-          `Sarvam timed out after ${Math.round(
-            timeoutMs / 1000
-          )}s`,
-          true
-        );
-      }
-
-      throw makeError(
-        `Sarvam network error: ${
-          error?.message || String(error)
-        }`,
-        true
-      );
-    }
-
-    console.log(
-      `Sarvam HTTP status: ${response.status}`
-    );
-
-    /**
-     * HTTP errors.
-     */
-    if (!response.ok) {
-      throw makeError(
-        `Sarvam API ${response.status}: ` +
-          responseText.slice(0, 500),
-
-        [
-          408,
-          425,
-          429,
-          500,
-          502,
-          503,
-          504
-        ].includes(response.status)
-      );
-    }
-
-    /**
-     * Parse Sarvam response.
-     */
-    let result;
-
-    try {
-      result =
-        JSON.parse(responseText);
-    } catch {
-      throw makeError(
-        `Sarvam returned invalid JSON: ` +
-          responseText.slice(0, 300),
-        true
-      );
-    }
-
-    const choice =
-      result?.choices?.[0];
-
-    const content =
-      choice?.message?.content;
-
-    if (!content) {
-      throw makeError(
-        `Sarvam returned empty content ` +
-          `(finish_reason=${
-            choice?.finish_reason ||
-            "unknown"
-          })`,
-        choice?.finish_reason !== "length"
-      );
-    }
-
-    /**
-     * Parse model's JSON.
-     */
-    const parsed =
-      parseSarvamJSON(content);
-
-    const knowledge =
-      normalizeKnowledge(parsed);
-
-    if (!knowledge) {
-      throw makeError(
-        "Invalid Sarvam response format: knowledge array missing",
-        true
-      );
-    }
-
-    return knowledge;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-
-/* =========================================================
-   ERROR HELPER
-   ========================================================= */
-
-function makeError(
-  message,
-  retriable
-) {
-  const error =
-    new Error(message);
-
-  error.retriable =
-    retriable;
-
-  return error;
-}
-
-
-/* =========================================================
-   PARSE SARVAM JSON
-   ========================================================= */
-
-function parseSarvamJSON(content) {
-  let text =
-    String(content);
-
-  /**
-   * Remove thinking blocks.
-   */
-  text = text.replace(
-    /<think>[\s\S]*?<\/think>/gi,
-    ""
-  );
-
-  if (
-    text.includes("</think>")
-  ) {
-    text =
-      text.split("</think>").pop();
-  }
-
-  /**
-   * Remove markdown fences.
-   */
-  text = text
-    .replace(
-      /^\s*```json\s*/i,
-      ""
-    )
-    .replace(
-      /^\s*```\s*/i,
-      ""
-    )
-    .replace(
-      /\s*```\s*$/i,
-      ""
-    )
-    .trim();
-
-  /**
-   * First attempt:
-   * parse the entire response.
-   */
-  try {
-    return JSON.parse(text);
-  } catch {}
-
-  /**
-   * Second attempt:
-   * find JSON object inside response.
-   */
-  const start =
-    text.indexOf("{");
-
-  const end =
-    text.lastIndexOf("}");
-
-  if (
-    start !== -1 &&
-    end > start
-  ) {
-    try {
-      return JSON.parse(
-        text.slice(
-          start,
-          end + 1
-        )
-      );
-    } catch (error) {
-      throw makeError(
-        `Could not parse Sarvam JSON: ${error.message}`,
-        true
-      );
-    }
-  }
-
-  throw makeError(
-    "Could not find JSON object in Sarvam response",
-    true
-  );
-}
-
-
-/* =========================================================
-   NORMALIZE KNOWLEDGE
-   ========================================================= */
-
-function normalizeKnowledge(parsed) {
-  /**
-   * Already an array.
-   */
-  if (Array.isArray(parsed)) {
-    return parsed;
-  }
-
-  /**
-   * Standard format.
-   */
-  if (
-    Array.isArray(
-      parsed?.knowledge
-    )
-  ) {
-    return parsed.knowledge;
-  }
-
-  /**
-   * Support:
-   *
-   * {
-   *   business_name: "...",
-   *   services: [...]
-   * }
-   */
-  if (
-    isObject(parsed) &&
-    !("knowledge" in parsed)
-  ) {
-    return Object.entries(
-      parsed
-    ).map(
-      ([field, data]) => ({
-        field,
-        data
-      })
-    );
-  }
-
-  return null;
-}
-
-
-/* =========================================================
-   GROUP KNOWLEDGE
-   ========================================================= */
-
-function groupKnowledge(items) {
-  const grouped =
-    new Map();
-
-  for (const item of items) {
-    if (
-      !item ||
-      typeof item.field !==
-        "string"
-    ) {
-      continue;
-    }
-
-    const field =
-      item.field
-        .trim()
-        .toLowerCase()
-        .replace(
-          /[^a-z0-9]+/g,
-          "_"
-        )
-        .replace(
-          /^_+|_+$/g,
-          ""
-        );
-
-    if (
-      !field ||
-      isEmptyValue(item.data)
-    ) {
-      continue;
-    }
-
-    grouped.set(
-      field,
-
-      grouped.has(field)
-        ? mergeValues(
-            grouped.get(field),
-            item.data
-          )
-        : item.data
-    );
-
-    if (
-      grouped.size >=
-      MAX_FIELDS_PER_PAGE
-    ) {
-      break;
-    }
-  }
-
-  return grouped;
-}
-
-
-/* =========================================================
-   EMPTY VALUE CHECK
-   ========================================================= */
-
-function isEmptyValue(value) {
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return true;
-  }
-
-  if (
-    typeof value ===
-    "string"
-  ) {
-    return (
-      value.trim() === ""
-    );
-  }
-
-  if (
-    Array.isArray(value)
-  ) {
-    return value.length === 0;
-  }
-
-  if (
-    isObject(value)
-  ) {
-    return (
-      Object.keys(value)
-        .length === 0
-    );
-  }
-
-  return false;
-}
-
-
-/* =========================================================
-   SAVE ALL KNOWLEDGE
-   ========================================================= */
-
-async function saveAll(
-  applicationId,
-  grouped,
-  sourceUrl,
-  env
-) {
-  const fields =
-    [...grouped.keys()];
-
-  console.log(
-    `Preparing to save ${fields.length} knowledge field(s)`
-  );
-
-  /**
-   * Fetch existing knowledge first.
-   */
-  const existingByField =
-    await getExistingKnowledgeBatch(
-      applicationId,
-      fields,
-      env
-    );
-
-  /**
-   * Save fields.
-   *
-   * Promise.allSettled allows us to see
-   * exactly which field failed.
-   */
-  const results =
-    await Promise.allSettled(
-      fields.map(
-        (field) =>
-          saveKnowledge(
-            applicationId,
-            field,
-            grouped.get(field),
-            existingByField.get(field) ||
-              null,
-            sourceUrl,
-            env
-          )
-      )
-    );
-
-  const failed =
-    results.filter(
-      (result) =>
-        result.status ===
-        "rejected"
-    );
-
-  if (
-    failed.length > 0
-  ) {
-    const firstError =
-      failed[0].reason;
-
-    throw new Error(
-      `Failed to save ` +
-        `${failed.length}/${results.length} ` +
-        `knowledge items: ` +
-        `${
-          firstError?.message ||
-          String(firstError)
-        }`
-    );
-  }
-
-  console.log(
-    `Successfully saved ${fields.length} knowledge field(s)`
-  );
-}
-
-
-/* =========================================================
-   GET EXISTING KNOWLEDGE
-   ========================================================= */
-
-async function getExistingKnowledgeBatch(
-  applicationId,
-  fields,
-  env
-) {
-  if (!fields.length) {
-    return new Map();
-  }
-
-  /**
-   * Fields are already sanitized by groupKnowledge()
-   * to [a-z0-9_], so they are safe here.
-   */
-  const fieldList =
-    fields.join(",");
-
-  const url =
+}) {
+  const existingUrl =
     `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
-    `?application_id=eq.${encodeURIComponent(
-      applicationId
-    )}` +
-    `&field=in.(${encodeURIComponent(
-      fieldList
-    )})` +
-    `&select=*`;
+    `?application_id=eq.${encodeURIComponent(applicationId)}` +
+    `&field=eq.${encodeURIComponent(field)}` +
+    `&select=id,data,source_urls`;
 
-  const response =
-    await fetch(url, {
-      method: "GET",
-      headers:
-        supabaseHeaders(env)
-    });
+  const existingResponse = await fetch(existingUrl, {
+    method: "GET",
+    headers: supabaseHeaders(env),
+  });
 
-  if (!response.ok) {
+  if (!existingResponse.ok) {
+    const body = await existingResponse.text();
+
     throw new Error(
-      `GET business_knowledge failed: ` +
-        `${response.status} ` +
-        `${await response.text()}`
+      `Failed to check existing knowledge: ${existingResponse.status} ${body}`
     );
   }
 
-  const rows =
-    await response.json();
+  const existingRows = await existingResponse.json();
 
-  const map =
-    new Map();
+  // ----------------------------------------------------------
+  // EXISTING FIELD → UPDATE
+  // ----------------------------------------------------------
 
-  for (const row of rows) {
-    if (
-      !map.has(row.field)
-    ) {
-      map.set(
-        row.field,
-        row
-      );
-    }
-  }
+  if (existingRows.length > 0) {
+    const existing = existingRows[0];
 
-  return map;
-}
-
-
-/* =========================================================
-   GET ONE EXISTING KNOWLEDGE ROW
-   ========================================================= */
-
-async function getExistingKnowledge(
-  applicationId,
-  field,
-  env
-) {
-  const map =
-    await getExistingKnowledgeBatch(
-      applicationId,
-      [field],
-      env
+    const mergedData = mergeKnowledgeData(
+      existing.data,
+      data
     );
 
-  return (
-    map.get(field) ||
-    null
-  );
-}
+    const sourceUrls = mergeSourceUrls(
+      existing.source_urls,
+      sourceUrl
+    );
 
+    const updateUrl =
+      `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
+      `?id=eq.${encodeURIComponent(existing.id)}`;
 
-/* =========================================================
-   SAVE ONE KNOWLEDGE FIELD
-   ========================================================= */
-
-async function saveKnowledge(
-  applicationId,
-  field,
-  newValue,
-  existing,
-  sourceUrl,
-  env
-) {
-  const base =
-    `${env.SUPABASE_URL}/rest/v1/business_knowledge`;
-
-  const now =
-    new Date().toISOString();
-
-  /**
-   * Merge with existing knowledge.
-   */
-  const mergedData =
-    existing &&
-    existing.data !== null &&
-    existing.data !== undefined
-      ? mergeValues(
-          existing.data,
-          newValue
-        )
-      : newValue;
-
-  /**
-   * Merge source URLs.
-   */
-  const existingSources =
-    Array.isArray(
-      existing?.source_urls
-    )
-      ? existing.source_urls
-      : [];
-
-  const sourceUrls =
-    [
-      ...new Set(
-        [
-          ...existingSources,
-          sourceUrl
-        ].filter(Boolean)
-      )
-    ];
-
-  /**
-   * Existing row:
-   * PATCH
-   */
-  if (existing?.id) {
-    await writeKnowledge(
-      "PATCH",
-      `${base}?id=eq.${encodeURIComponent(
-        existing.id
-      )}`,
-      {
+    const updateResponse = await fetch(updateUrl, {
+      method: "PATCH",
+      headers: {
+        ...supabaseHeaders(env),
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
         data: mergedData,
         source_urls: sourceUrls,
-        updated_at: now
-      },
-      env
-    );
+        updated_at: new Date().toISOString(),
+      }),
+    });
+
+    if (!updateResponse.ok) {
+      const body = await updateResponse.text();
+
+      throw new Error(
+        `Failed to update business_knowledge: ${updateResponse.status} ${body}`
+      );
+    }
 
     console.log(
-      `Updated knowledge: ${field}`
+      "Updated knowledge:",
+      field
     );
 
     return;
   }
 
-  /**
-   * New row:
-   * INSERT
-   */
-  try {
-    await writeKnowledge(
-      "POST",
-      base,
-      {
-        application_id:
-          applicationId,
+  // ----------------------------------------------------------
+  // NEW FIELD → INSERT
+  // ----------------------------------------------------------
 
-        field,
+  const insertUrl =
+    `${env.SUPABASE_URL}/rest/v1/business_knowledge`;
 
-        data:
-          mergedData,
+  const insertResponse = await fetch(insertUrl, {
+    method: "POST",
+    headers: {
+      ...supabaseHeaders(env),
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({
+      application_id: applicationId,
+      field,
+      data,
+      source_urls: sourceUrl
+        ? [sourceUrl]
+        : [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+  });
 
-        source_urls:
-          sourceUrls,
-
-        created_at:
-          now,
-
-        updated_at:
-          now
-      },
-      env
-    );
-
+  if (insertResponse.ok) {
     console.log(
-      `Inserted knowledge: ${field}`
+      "Inserted knowledge:",
+      field
     );
-  } catch (error) {
-    /**
-     * Another request may have inserted
-     * the same field at the same time.
-     */
-    if (
-      error?.status ===
-      409
-    ) {
-      console.log(
-        `Conflict inserting ${field}; fetching existing row`
-      );
 
-      const current =
-        await getExistingKnowledge(
-          applicationId,
-          field,
-          env
-        );
-
-      if (current) {
-        return saveKnowledge(
-          applicationId,
-          field,
-          newValue,
-          current,
-          sourceUrl,
-          env
-        );
-      }
-    }
-
-    throw error;
+    return;
   }
-}
 
+  // ----------------------------------------------------------
+  // RACE CONDITION RETRY
+  // ----------------------------------------------------------
 
-/* =========================================================
-   WRITE KNOWLEDGE
-   ========================================================= */
+  const body = await insertResponse.text();
 
-async function writeKnowledge(
-  method,
-  url,
-  body,
-  env
-) {
-  const payload =
-    { ...body };
+  if (insertResponse.status === 409) {
+    console.log(
+      "Knowledge appeared during insert; retrying:",
+      field
+    );
 
-  /**
-   * These columns must exist.
-   */
-  const required = [
-    "application_id",
-    "field",
-    "data"
-  ];
+    await saveKnowledge({
+      applicationId,
+      field,
+      data,
+      sourceUrl,
+      env,
+    });
 
-  /**
-   * Try a few times in case an optional
-   * column doesn't exist in the database.
-   */
-  for (
-    let i = 0;
-    i < 4;
-    i++
-  ) {
-    const response =
-      await fetch(url, {
-        method,
-
-        headers: {
-          ...supabaseHeaders(env),
-
-          "Prefer":
-            "return=minimal"
-        },
-
-        body:
-          JSON.stringify(
-            payload
-          )
-      });
-
-    if (
-      response.ok
-    ) {
-      return;
-    }
-
-    const text =
-      await response.text();
-
-    /**
-     * Supabase/PostgREST missing column.
-     */
-    const missingColumn =
-      text.match(
-        /Could not find the '([^']+)' column/
-      );
-
-    if (
-      response.status ===
-        400 &&
-      missingColumn &&
-      missingColumn[1] in
-        payload &&
-      !required.includes(
-        missingColumn[1]
-      )
-    ) {
-      console.warn(
-        `business_knowledge has no column "${missingColumn[1]}". Retrying without it.`
-      );
-
-      delete payload[
-        missingColumn[1]
-      ];
-
-      continue;
-    }
-
-    const error =
-      new Error(
-        `business_knowledge ${method} failed: ` +
-          `${response.status} ${text}`
-      );
-
-    error.status =
-      response.status;
-
-    throw error;
+    return;
   }
 
   throw new Error(
-    "business_knowledge write failed after column fallbacks"
+    `Failed to insert business_knowledge: ${insertResponse.status} ${body}`
   );
 }
 
+// ============================================================
+// MERGE KNOWLEDGE
+// ============================================================
 
-/* =========================================================
-   MERGE VALUES
-   ========================================================= */
-
-function mergeValues(
-  oldValue,
-  newValue
-) {
-  /**
-   * Arrays:
-   * combine and remove duplicates.
-   */
+function mergeKnowledgeData(oldData, newData) {
   if (
-    Array.isArray(oldValue) ||
-    Array.isArray(newValue)
+    Array.isArray(oldData) &&
+    Array.isArray(newData)
   ) {
-    return removeDuplicates(
-      [
-        ...toArray(oldValue),
-        ...toArray(newValue)
-      ]
-    );
+    return unique([
+      ...oldData,
+      ...newData,
+    ]);
   }
 
-  /**
-   * Objects:
-   * merge properties.
-   */
   if (
-    isObject(oldValue) &&
-    isObject(newValue)
+    typeof oldData === "object" &&
+    oldData !== null &&
+    typeof newData === "object" &&
+    newData !== null &&
+    !Array.isArray(oldData) &&
+    !Array.isArray(newData)
   ) {
     return {
-      ...oldValue,
-      ...newValue
+      ...oldData,
+      ...newData,
     };
   }
 
-  /**
-   * Different primitive values:
-   * keep both.
-   */
-  if (
-    JSON.stringify(
-      oldValue
-    ) !==
-    JSON.stringify(
-      newValue
-    )
-  ) {
-    return removeDuplicates(
-      [
-        oldValue,
-        newValue
-      ]
-    );
+  // New data is more recent.
+  return newData;
+}
+
+function mergeSourceUrls(existing, newUrl) {
+  const urls = Array.isArray(existing)
+    ? [...existing]
+    : [];
+
+  if (newUrl) {
+    urls.push(newUrl);
   }
 
-  return oldValue;
+  return unique(urls);
 }
 
-
-/* =========================================================
-   ARRAY HELPER
-   ========================================================= */
-
-function toArray(value) {
-  return Array.isArray(value)
-    ? value
-    : [value];
-}
-
-
-/* =========================================================
-   REMOVE DUPLICATES
-   ========================================================= */
-
-function removeDuplicates(
-  array
-) {
-  const seen =
-    new Set();
-
-  const result =
-    [];
-
-  for (
-    const item of array
-  ) {
-    const key =
-      item !== null &&
-      typeof item ===
-        "object"
-        ? JSON.stringify(
-            item
-          )
-        : String(item)
-            .trim()
-            .toLowerCase();
-
-    if (
-      !seen.has(key)
-    ) {
-      seen.add(key);
-      result.push(item);
-    }
-  }
-
-  return result;
-}
-
-
-/* =========================================================
-   OBJECT CHECK
-   ========================================================= */
-
-function isObject(value) {
-  return (
-    value !== null &&
-    typeof value ===
-      "object" &&
-    !Array.isArray(value)
-  );
-}
-
-
-/* =========================================================
-   SUPABASE HEADERS
-   ========================================================= */
-
-function supabaseHeaders(
-  env
-) {
-  return {
-    "apikey":
-      env.SUPABASE_SERVICE_ROLE_KEY,
-
-    "Authorization":
-      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-
-    "Content-Type":
-      "application/json"
-  };
-}
-
-
-/* =========================================================
-   JSON RESPONSE
-   ========================================================= */
-
-function jsonResponse(
-  data,
-  status = 200
-) {
-  return new Response(
-    JSON.stringify(data),
-    {
-      status,
-
-      headers: {
-        ...corsHeaders(),
-
-        "Content-Type":
-          "application/json"
-      }
-    }
-  );
-}
-
-
-/* =========================================================
-   CORS
-   ========================================================= */
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
 
 function corsHeaders() {
   return {
-    "Access-Control-Allow-Origin":
-      "*",
-
-    "Access-Control-Allow-Methods":
-      "GET, POST, OPTIONS",
-
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization"
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
 }
 
-
-/* =========================================================
-   SLEEP
-   ========================================================= */
-
-function sleep(ms) {
-  return new Promise(
-    (resolve) =>
-      setTimeout(
-        resolve,
-        ms
-      )
+function json(data, status = 200) {
+  return new Response(
+    JSON.stringify(data, null, 2),
+    {
+      status,
+      headers: {
+        ...corsHeaders(),
+        "Content-Type": "application/json",
+      },
+    }
   );
-            }
+        }
