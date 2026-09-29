@@ -1,92 +1,53 @@
 /**
- * Reportli AI — Business Knowledge Worker
+ * Reportli AI
+ * Business Knowledge Worker
  *
- * AI-FREE / RULE-BASED
+ * NO AI
+ * NO Sarvam
+ * NO OpenAI
+ * NO website scraping
  *
  * Flow:
  *
- * Scraper Worker
- *      ↓
- * business_data
- *      ↓
+ * business_data INSERT
+ *       ↓
  * Supabase Database Webhook
- *      ↓
+ *       ↓
  * This Worker
- *      ↓
- * Rule-based extraction
- *      ↓
+ *       ↓
+ * Generic rule-based extraction
+ *       ↓
  * business_knowledge
- *
- * This Worker does NOT:
- * - scrape websites
- * - call Sarvam
- * - call OpenAI
- * - use any AI
- *
- * Required secrets:
- * - SUPABASE_URL
- * - SUPABASE_SERVICE_ROLE_KEY
  */
 
-const MAX_TEXT_CHARS = 50000;
-
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     // ---------------------------------------------------------
-    // CORS / OPTIONS
-    // ---------------------------------------------------------
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders(),
-      });
-    }
-
-    // ---------------------------------------------------------
-    // HEALTH CHECK
+    // 1. Basic HTTP handling
     // ---------------------------------------------------------
 
     if (request.method === "GET") {
-      return json({
-        ok: true,
-        worker: "ai-free-business-knowledge-worker",
-        message: "Worker is running",
+      return jsonResponse({
+        success: true,
+        worker: "ai-business-knowledge-worker",
+        mode: "webhook",
+        ai: false,
+        message: "Business Knowledge Worker is running"
       });
     }
 
-    // ---------------------------------------------------------
-    // ONLY POST
-    // ---------------------------------------------------------
-
     if (request.method !== "POST") {
-      return json(
+      return jsonResponse(
         {
-          ok: false,
-          error: "Method not allowed",
+          success: false,
+          error: "Only POST requests are allowed"
         },
         405
       );
     }
 
     // ---------------------------------------------------------
-    // CHECK ENVIRONMENT
-    // ---------------------------------------------------------
-
-    if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
-      console.error("Missing Supabase environment variables");
-
-      return json(
-        {
-          ok: false,
-          error: "Worker is missing Supabase configuration",
-        },
-        500
-      );
-    }
-
-    // ---------------------------------------------------------
-    // READ WEBHOOK
+    // 2. Parse webhook body
     // ---------------------------------------------------------
 
     let payload;
@@ -94,1666 +55,1554 @@ export default {
     try {
       payload = await request.json();
     } catch (error) {
-      console.error("Invalid JSON:", error);
-
-      return json(
+      return jsonResponse(
         {
-          ok: false,
-          error: "Invalid JSON",
+          success: false,
+          error: "Invalid JSON body"
         },
         400
       );
     }
 
-    console.log("Webhook received");
+    console.log("Received webhook:", JSON.stringify(payload));
 
     // ---------------------------------------------------------
-    // EXTRACT BUSINESS_DATA RECORD
+    // 3. Extract business_data record
     // ---------------------------------------------------------
 
-    const record = extractRecord(payload);
+    const record = getBusinessDataRecord(payload);
 
     if (!record) {
       console.error("Could not find business_data record");
 
-      return json(
+      return jsonResponse(
         {
-          ok: false,
-          error: "Could not find business_data record in webhook payload",
+          success: false,
+          error: "Could not find business_data record in webhook payload"
         },
         400
       );
     }
 
-    console.log("business_data id:", record.id);
-    console.log("application_id:", record.application_id);
-    console.log("field:", record.field);
+    const applicationId = record.application_id;
+    const businessDataId = record.id;
+    const sourceUrl = record.source_url || null;
 
-    // ---------------------------------------------------------
-    // ONLY PROCESS PAGE DATA
-    // ---------------------------------------------------------
+    if (!applicationId) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "application_id is missing"
+        },
+        400
+      );
+    }
 
-    if (record.field !== "page") {
-      console.log("Ignoring non-page field:", record.field);
-
-      return json({
-        ok: true,
-        ignored: true,
-        reason: "Only page fields are processed",
-        id: record.id,
-      });
+    if (!businessDataId) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "business_data id is missing"
+        },
+        400
+      );
     }
 
     // ---------------------------------------------------------
-    // PROCESS
+    // 4. Mark source row as processing
     // ---------------------------------------------------------
 
+    await updateBusinessDataStatus(
+      env,
+      businessDataId,
+      "processing",
+      null
+    );
+
     try {
-      const result = await processBusinessData(record, env);
+      // -------------------------------------------------------
+      // 5. Extract raw page data
+      // -------------------------------------------------------
 
-      return json({
-        ok: true,
-        ...result,
-      });
-    } catch (error) {
-      console.error(
-        "Processing failed:",
-        error?.stack || error?.message || String(error)
-      );
+      const rawData = record.data;
 
-      // Try to save the error back to business_data.
-      try {
-        await updateBusinessDataStatus(
-          record.id,
-          "failed",
-          error?.message || String(error),
-          env
-        );
-      } catch (statusError) {
-        console.error(
-          "Could not save error status:",
-          statusError?.message || String(statusError)
-        );
+      if (
+        rawData === null ||
+        rawData === undefined ||
+        rawData === ""
+      ) {
+        throw new Error("business_data.data is empty");
       }
 
-      return json(
+      // -------------------------------------------------------
+      // 6. Generic extraction
+      // -------------------------------------------------------
+
+      const extracted = extractKnowledge(rawData);
+
+      console.log(
+        "Extracted knowledge:",
+        JSON.stringify(extracted)
+      );
+
+      // -------------------------------------------------------
+      // 7. Save extracted knowledge
+      // -------------------------------------------------------
+
+      let savedCount = 0;
+
+      for (const item of extracted) {
+        if (!item.field) {
+          continue;
+        }
+
+        if (
+          item.data === null ||
+          item.data === undefined ||
+          item.data === ""
+        ) {
+          continue;
+        }
+
+        await upsertKnowledge(
+          env,
+          applicationId,
+          item.field,
+          item.data,
+          sourceUrl
+        );
+
+        savedCount++;
+      }
+
+      // -------------------------------------------------------
+      // 8. Mark source row as completed
+      // -------------------------------------------------------
+
+      await updateBusinessDataStatus(
+        env,
+        businessDataId,
+        "completed",
+        null
+      );
+
+      console.log(
+        `Completed application ${applicationId}. Saved ${savedCount} knowledge fields.`
+      );
+
+      return jsonResponse({
+        success: true,
+        ai: false,
+        application_id: applicationId,
+        business_data_id: businessDataId,
+        fields_saved: savedCount
+      });
+    } catch (error) {
+      console.error("Knowledge extraction failed:", error);
+
+      await updateBusinessDataStatus(
+        env,
+        businessDataId,
+        "failed",
+        error.message
+      );
+
+      return jsonResponse(
         {
-          ok: false,
-          error: error?.message || String(error),
-          id: record.id,
+          success: false,
+          ai: false,
+          error: error.message
         },
         500
       );
     }
-  },
+  }
 };
 
-// ============================================================
-// MAIN PROCESSOR
-// ============================================================
 
-async function processBusinessData(record, env) {
-  if (!record.id) {
-    throw new Error("business_data id is missing");
-  }
-
-  if (!record.application_id) {
-    throw new Error("application_id is missing");
-  }
-
-  // ----------------------------------------------------------
-  // MARK AS PROCESSING
-  // ----------------------------------------------------------
-
-  await updateBusinessDataStatus(
-    record.id,
-    "processing",
-    null,
-    env
-  );
-
-  // ----------------------------------------------------------
-  // CONVERT RAW DATA INTO TEXT
-  // ----------------------------------------------------------
-
-  const rawText = extractAllText(record.data);
-
-  if (!rawText.trim()) {
-    throw new Error("business_data.data contains no usable text");
-  }
-
-  console.log("Raw text length:", rawText.length);
-
-  // ----------------------------------------------------------
-  // EXTRACT RULE-BASED KNOWLEDGE
-  // ----------------------------------------------------------
-
-  const extracted = extractKnowledge({
-    data: record.data,
-    text: rawText,
-    sourceUrl: record.source_url || null,
-  });
-
-  console.log(
-    "Extracted fields:",
-    Object.keys(extracted)
-  );
-
-  // ----------------------------------------------------------
-  // SAVE TO business_knowledge
-  // ----------------------------------------------------------
-
-  const fields = Object.entries(extracted);
-
-  let savedCount = 0;
-
-  for (const [field, data] of fields) {
-    if (
-      data === null ||
-      data === undefined ||
-      data === "" ||
-      (Array.isArray(data) && data.length === 0)
-    ) {
-      continue;
-    }
-
-    await saveKnowledge({
-      applicationId: record.application_id,
-      field,
-      data,
-      sourceUrl: record.source_url || null,
-      env,
-    });
-
-    savedCount++;
-  }
-
-  // ----------------------------------------------------------
-  // MARK COMPLETED
-  // ----------------------------------------------------------
-
-  await updateBusinessDataStatus(
-    record.id,
-    "completed",
-    null,
-    env
-  );
-
-  return {
-    processed: true,
-    id: record.id,
-    application_id: record.application_id,
-    fields_found: fields.length,
-    fields_saved: savedCount,
-  };
-}
-
-// ============================================================
+// =============================================================
 // WEBHOOK RECORD EXTRACTION
-// ============================================================
+// =============================================================
 
-function extractRecord(payload) {
-  // Supabase Database Webhook normally sends the row directly.
+function getBusinessDataRecord(payload) {
+  /*
+   * Supabase Database Webhook normally sends:
+   *
+   * {
+   *   id,
+   *   application_id,
+   *   field,
+   *   data,
+   *   source_url,
+   *   ...
+   * }
+   *
+   * We also support common wrapped formats.
+   */
 
   if (
     payload &&
     payload.id &&
     payload.application_id &&
-    payload.field
+    Object.prototype.hasOwnProperty.call(payload, "data")
   ) {
     return payload;
   }
 
-  // Support common wrapped payload formats too.
-
-  if (
-    payload?.record?.id &&
-    payload?.record?.application_id
-  ) {
+  if (payload?.record) {
     return payload.record;
   }
 
-  if (
-    payload?.new_record?.id &&
-    payload?.new_record?.application_id
-  ) {
+  if (payload?.new_record) {
     return payload.new_record;
   }
 
-  if (
-    payload?.data?.record?.id &&
-    payload?.data?.record?.application_id
-  ) {
+  if (payload?.data?.record) {
     return payload.data.record;
   }
 
-  if (
-    payload?.data?.new_record?.id &&
-    payload?.data?.new_record?.application_id
-  ) {
+  if (payload?.data?.new_record) {
     return payload.data.new_record;
   }
 
   return null;
 }
 
-// ============================================================
-// TEXT EXTRACTION
-// ============================================================
 
-function extractAllText(value, depth = 0) {
-  if (depth > 10) {
-    return "";
+// =============================================================
+// MAIN GENERIC EXTRACTOR
+// =============================================================
+
+function extractKnowledge(rawData) {
+  const results = [];
+
+  // -----------------------------------------------------------
+  // CASE 1: Structured JSON object
+  // -----------------------------------------------------------
+
+  if (
+    typeof rawData === "object" &&
+    rawData !== null &&
+    !Array.isArray(rawData)
+  ) {
+    extractObject(rawData, results);
   }
 
-  if (value === null || value === undefined) {
-    return "";
+  // -----------------------------------------------------------
+  // CASE 2: Array
+  // -----------------------------------------------------------
+
+  else if (Array.isArray(rawData)) {
+    extractArray(rawData, results);
   }
 
-  if (typeof value === "string") {
-    return value;
+  // -----------------------------------------------------------
+  // CASE 3: Raw text
+  // -----------------------------------------------------------
+
+  else if (typeof rawData === "string") {
+    extractText(rawData, results);
   }
 
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
+  // -----------------------------------------------------------
+  // CASE 4: Number / boolean / other
+  // -----------------------------------------------------------
+
+  else {
+    results.push({
+      field: "pending",
+      data: rawData
+    });
   }
 
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => extractAllText(item, depth + 1))
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  if (typeof value === "object") {
-    return Object.entries(value)
-      .map(([key, val]) => {
-        const valueText = extractAllText(val, depth + 1);
-
-        if (!valueText) {
-          return "";
-        }
-
-        return `${key}: ${valueText}`;
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  return "";
+  return cleanResults(results);
 }
 
-// ============================================================
-// MAIN RULE ENGINE
-// ============================================================
 
-function extractKnowledge({ data, text, sourceUrl }) {
-  const result = {};
+// =============================================================
+// OBJECT EXTRACTION
+// =============================================================
 
-  const cleanText = cleanTextValue(text);
-
-  // ----------------------------------------------------------
-  // 1. BUSINESS NAME
-  // ----------------------------------------------------------
-
-  const businessName = extractBusinessName(data, cleanText);
-
-  if (businessName) {
-    result.business_name = businessName;
-  }
-
-  // ----------------------------------------------------------
-  // 2. DESCRIPTION
-  // ----------------------------------------------------------
-
-  const description = extractDescription(data, cleanText);
-
-  if (description) {
-    result.description = description;
-  }
-
-  // ----------------------------------------------------------
-  // 3. LOCATION
-  // ----------------------------------------------------------
-
-  const location = extractLocation(data, cleanText);
-
-  if (location) {
-    result.location = location;
-  }
-
-  // ----------------------------------------------------------
-  // 4. PHONE NUMBERS
-  // ----------------------------------------------------------
-
-  const phones = extractPhones(data, cleanText);
-
-  if (phones.length > 0) {
-    result.phone_numbers = phones;
-  }
-
-  // ----------------------------------------------------------
-  // 5. EMAILS
-  // ----------------------------------------------------------
-
-  const emails = extractEmails(data, cleanText);
-
-  if (emails.length > 0) {
-    result.emails = emails;
-  }
-
-  // ----------------------------------------------------------
-  // 6. ADDRESS
-  // ----------------------------------------------------------
-
-  const address = extractAddress(data, cleanText);
-
-  if (address) {
-    result.address = address;
-  }
-
-  // ----------------------------------------------------------
-  // 7. SERVICES
-  // ----------------------------------------------------------
-
-  const services = extractServices(data, cleanText);
-
-  if (services.length > 0) {
-    result.services = services;
-  }
-
-  // ----------------------------------------------------------
-  // 8. BOOKING URL
-  // ----------------------------------------------------------
-
-  const bookingUrl = extractBookingUrl(data, cleanText);
-
-  if (bookingUrl) {
-    result.booking_url = bookingUrl;
-  }
-
-  // ----------------------------------------------------------
-  // 9. WHATSAPP
-  // ----------------------------------------------------------
-
-  const whatsapp = extractWhatsApp(data, cleanText);
-
-  if (whatsapp) {
-    result.whatsapp = whatsapp;
-  }
-
-  // ----------------------------------------------------------
-  // 10. SOCIAL LINKS
-  // ----------------------------------------------------------
-
-  const socialLinks = extractSocialLinks(data, cleanText);
-
-  if (Object.keys(socialLinks).length > 0) {
-    result.social_links = socialLinks;
-  }
-
-  // ----------------------------------------------------------
-  // 11. EXPERIENCE
-  // ----------------------------------------------------------
-
-  const experience = extractExperience(cleanText);
-
-  if (experience) {
-    result.experience = experience;
-  }
-
-  // ----------------------------------------------------------
-  // 12. CUSTOMER COUNT
-  // ----------------------------------------------------------
-
-  const customers = extractMetric(
-    cleanText,
-    [
-      "customers",
-      "clients",
-      "guests",
-      "members",
-    ]
-  );
-
-  if (customers !== null) {
-    result.customers = customers;
-  }
-
-  // ----------------------------------------------------------
-  // 13. STAFF / STYLIST COUNT
-  // ----------------------------------------------------------
-
-  const stylists = extractMetric(
-    cleanText,
-    [
-      "stylists",
-      "staff",
-      "employees",
-      "therapists",
-      "doctors",
-      "professionals",
-    ]
-  );
-
-  if (stylists !== null) {
-    result.stylists = stylists;
-  }
-
-  // ----------------------------------------------------------
-  // 14. PAYMENT METHODS
-  // ----------------------------------------------------------
-
-  const paymentMethods = extractPaymentMethods(cleanText);
-
-  if (paymentMethods.length > 0) {
-    result.payment_methods = paymentMethods;
-  }
-
-  // ----------------------------------------------------------
-  // 15. OPENING HOURS
-  // ----------------------------------------------------------
-
-  const openingHours = extractOpeningHours(cleanText);
-
-  if (openingHours.length > 0) {
-    result.opening_hours = openingHours;
-  }
-
-  // ----------------------------------------------------------
-  // 16. SOURCE URL
-  // ----------------------------------------------------------
-
-  if (sourceUrl) {
-    result.source_url = sourceUrl;
-  }
-
-  return result;
-}
-
-// ============================================================
-// BUSINESS NAME
-// ============================================================
-
-function extractBusinessName(data, text) {
-  // First use explicitly structured fields if the scraper
-  // already provided them.
-
-  const direct = findObjectValue(
-    data,
-    [
-      "business_name",
-      "businessName",
-      "company_name",
-      "companyName",
-      "organization_name",
-      "organizationName",
-      "hotel_name",
-      "hotelName",
-      "brand_name",
-      "brandName",
-    ]
-  );
-
-  if (direct) {
-    return cleanBusinessName(String(direct));
-  }
-
-  // Look for title.
-
-  const title = findObjectValue(
-    data,
-    [
-      "title",
-      "page_title",
-      "pageTitle",
-    ]
-  );
-
-  if (title) {
-    const name = cleanBusinessName(String(title));
-
-    if (isUsableBusinessName(name)) {
-      return name;
+function extractObject(obj, results, parentKey = "") {
+  for (const [rawKey, rawValue] of Object.entries(obj)) {
+    if (
+      rawKey === null ||
+      rawKey === undefined ||
+      rawKey === ""
+    ) {
+      continue;
     }
-  }
 
-  // Look for common text patterns.
+    const field = makeFieldName(rawKey);
 
-  const lines = getLines(text);
+    // Ignore obvious metadata/junk fields.
+    if (isJunkField(field)) {
+      continue;
+    }
 
-  for (const line of lines.slice(0, 20)) {
-    const lower = line.toLowerCase();
+    // ---------------------------------------------------------
+    // Nested object
+    // ---------------------------------------------------------
 
     if (
-      lower.includes("welcome to ")
+      rawValue &&
+      typeof rawValue === "object" &&
+      !Array.isArray(rawValue)
     ) {
-      const value = line
-        .replace(/^welcome\s+to\s+/i, "")
-        .trim();
+      extractObject(rawValue, results, field);
+      continue;
+    }
 
-      if (isUsableBusinessName(value)) {
-        return cleanBusinessName(value);
+    // ---------------------------------------------------------
+    // Array
+    // ---------------------------------------------------------
+
+    if (Array.isArray(rawValue)) {
+      const cleanedArray = cleanArray(rawValue);
+
+      if (cleanedArray.length === 0) {
+        continue;
+      }
+
+      results.push({
+        field,
+        data: cleanedArray
+      });
+
+      continue;
+    }
+
+    // ---------------------------------------------------------
+    // Primitive value
+    // ---------------------------------------------------------
+
+    if (
+      rawValue !== null &&
+      rawValue !== undefined &&
+      String(rawValue).trim() !== ""
+    ) {
+      const cleanedValue = cleanValue(rawValue);
+
+      if (
+        cleanedValue !== null &&
+        cleanedValue !== undefined &&
+        String(cleanedValue).trim() !== ""
+      ) {
+        results.push({
+          field,
+          data: cleanedValue
+        });
+      }
+    }
+  }
+}
+
+
+// =============================================================
+// ARRAY EXTRACTION
+// =============================================================
+
+function extractArray(array, results) {
+  const primitiveValues = [];
+  const objectValues = [];
+
+  for (const item of array) {
+    if (item === null || item === undefined) {
+      continue;
+    }
+
+    if (
+      typeof item === "object" &&
+      !Array.isArray(item)
+    ) {
+      objectValues.push(item);
+    } else if (Array.isArray(item)) {
+      extractArray(item, results);
+    } else {
+      const cleaned = cleanValue(item);
+
+      if (
+        cleaned !== null &&
+        cleaned !== undefined &&
+        String(cleaned).trim() !== ""
+      ) {
+        primitiveValues.push(cleaned);
       }
     }
   }
 
-  // First line containing a likely business name.
+  if (primitiveValues.length > 0) {
+    results.push({
+      field: "pending",
+      data: uniqueValues(primitiveValues)
+    });
+  }
 
-  for (const line of lines.slice(0, 10)) {
-    if (isUsableBusinessName(line)) {
-      return cleanBusinessName(line);
+  for (const obj of objectValues) {
+    extractObject(obj, results);
+  }
+}
+
+
+// =============================================================
+// TEXT EXTRACTION
+// =============================================================
+
+function extractText(text, results) {
+  // -----------------------------------------------------------
+  // 1. Normalize text
+  // -----------------------------------------------------------
+
+  const normalized = normalizeText(text);
+
+  if (!normalized) {
+    return;
+  }
+
+  // -----------------------------------------------------------
+  // 2. Split into useful lines
+  // -----------------------------------------------------------
+
+  let lines = normalized
+    .split("\n")
+    .map(line => cleanLine(line))
+    .filter(Boolean);
+
+  // -----------------------------------------------------------
+  // 3. Remove duplicate lines
+  // -----------------------------------------------------------
+
+  lines = uniqueValues(lines);
+
+  // -----------------------------------------------------------
+  // 4. Remove obvious website junk
+  // -----------------------------------------------------------
+
+  lines = lines.filter(line => !isJunkLine(line));
+
+  if (lines.length === 0) {
+    return;
+  }
+
+  // -----------------------------------------------------------
+  // 5. Detect explicit key/value patterns
+  // -----------------------------------------------------------
+
+  const consumedIndexes = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // ---------------------------------------------------------
+    // Pattern:
+    //
+    // Phone: +91...
+    // Email: hello@example.com
+    // Address: ...
+    // ---------------------------------------------------------
+
+    const colonMatch = line.match(
+      /^([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})\s*:\s*(.+)$/
+    );
+
+    if (colonMatch) {
+      const field = makeFieldName(colonMatch[1]);
+      const value = cleanValue(colonMatch[2]);
+
+      if (
+        field &&
+        value &&
+        !isJunkField(field)
+      ) {
+        results.push({
+          field,
+          data: value
+        });
+
+        consumedIndexes.add(i);
+        continue;
+      }
+    }
+
+    // ---------------------------------------------------------
+    // Pattern:
+    //
+    // Phone - +91...
+    // Email - ...
+    // ---------------------------------------------------------
+
+    const dashMatch = line.match(
+      /^([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})\s+-\s+(.+)$/
+    );
+
+    if (dashMatch) {
+      const field = makeFieldName(dashMatch[1]);
+      const value = cleanValue(dashMatch[2]);
+
+      if (
+        field &&
+        value &&
+        !isJunkField(field)
+      ) {
+        results.push({
+          field,
+          data: value
+        });
+
+        consumedIndexes.add(i);
+        continue;
+      }
     }
   }
 
-  return null;
-}
+  // -----------------------------------------------------------
+  // 6. Detect emails
+  // -----------------------------------------------------------
 
-function cleanBusinessName(value) {
-  let result = value
-    .replace(/\s+/g, " ")
-    .trim();
+  const emails = extractEmails(normalized);
 
-  // Remove common page-title suffixes.
-
-  result = result
-    .replace(/\s*[|•·]\s*(home|homepage)\s*$/i, "")
-    .replace(/\s*[-|•·]\s*(home|homepage)\s*$/i, "")
-    .trim();
-
-  return result;
-}
-
-function isUsableBusinessName(value) {
-  if (!value) return false;
-
-  const lower = value.toLowerCase();
-
-  const blocked = [
-    "home",
-    "welcome",
-    "contact us",
-    "about us",
-    "services",
-    "our services",
-    "book appointment",
-    "gallery",
-    "menu",
-    "navigation",
-  ];
-
-  if (blocked.includes(lower)) {
-    return false;
+  if (emails.length > 0) {
+    results.push({
+      field: "email",
+      data: emails
+    });
   }
 
-  if (value.length < 3) {
-    return false;
+  // -----------------------------------------------------------
+  // 7. Detect URLs
+  // -----------------------------------------------------------
+
+  const urls = extractUrls(normalized);
+
+  if (urls.length > 0) {
+    results.push({
+      field: "urls",
+      data: urls
+    });
   }
 
-  if (value.length > 150) {
-    return false;
+  // -----------------------------------------------------------
+  // 8. Detect phone numbers
+  // -----------------------------------------------------------
+
+  const phones = extractPhones(normalized);
+
+  if (phones.length > 0) {
+    results.push({
+      field: "phone",
+      data: phones
+    });
   }
 
-  return true;
-}
+  // -----------------------------------------------------------
+  // 9. Detect "8000 + CUSTOMERS" type patterns
+  // -----------------------------------------------------------
 
-// ============================================================
-// DESCRIPTION
-// ============================================================
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
 
-function extractDescription(data, text) {
-  const direct = findObjectValue(
-    data,
-    [
-      "description",
-      "about",
-      "about_us",
-      "aboutUs",
-      "business_description",
-      "businessDescription",
-    ]
-  );
+    const metricMatch = line.match(
+      /^([\d,.]+)\s*\+\s*([A-Za-z][A-Za-z0-9 _/&().'-]{1,80})$/i
+    );
 
-  if (direct && typeof direct === "string") {
-    return cleanTextValue(direct);
+    if (metricMatch) {
+      const number = parseNumber(metricMatch[1]);
+      const label = makeFieldName(metricMatch[2]);
+
+      if (label) {
+        results.push({
+          field: label,
+          data: number
+        });
+
+        consumedIndexes.add(i);
+      }
+    }
   }
 
-  const lines = getLines(text);
+  // -----------------------------------------------------------
+  // 10. Detect headings followed by lists
+  // -----------------------------------------------------------
 
-  const headingIndex = findHeadingIndex(lines, [
-    "about",
-    "about us",
-    "about-us",
-    "welcome",
-    "welcome to",
-  ]);
+  for (let i = 0; i < lines.length; i++) {
+    if (consumedIndexes.has(i)) {
+      continue;
+    }
 
-  if (headingIndex >= 0) {
-    const collected = [];
+    const heading = lines[i];
 
-    for (
-      let i = headingIndex + 1;
-      i < Math.min(lines.length, headingIndex + 8);
-      i++
-    ) {
-      const line = lines[i];
+    if (!looksLikeHeading(heading)) {
+      continue;
+    }
 
-      if (isSectionHeading(line)) {
+    const list = [];
+
+    let j = i + 1;
+
+    while (j < lines.length) {
+      const candidate = lines[j];
+
+      if (consumedIndexes.has(j)) {
+        j++;
+        continue;
+      }
+
+      if (isJunkLine(candidate)) {
+        j++;
+        continue;
+      }
+
+      if (looksLikeHeading(candidate)) {
         break;
       }
 
-      if (line.length >= 30) {
-        collected.push(line);
+      if (looksLikeLongSentence(candidate)) {
+        break;
       }
-    }
-
-    if (collected.length > 0) {
-      return collected.join(" ").slice(0, 2000);
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// LOCATION
-// ============================================================
-
-function extractLocation(data, text) {
-  const direct = findObjectValue(
-    data,
-    [
-      "location",
-      "city",
-      "town",
-      "area",
-      "addressLocality",
-    ]
-  );
-
-  if (direct) {
-    return String(direct).trim();
-  }
-
-  // Common title format:
-  // Business Name | Pollachi
-
-  const firstLines = getLines(text).slice(0, 5);
-
-  for (const line of firstLines) {
-    const parts = line.split("|");
-
-    if (parts.length >= 2) {
-      const last = parts[parts.length - 1].trim();
 
       if (
-        last.length >= 2 &&
-        last.length <= 80 &&
-        !isGenericPageWord(last)
+        containsContactInformation(candidate) ||
+        looksLikeUrl(candidate)
       ) {
-        return last;
+        break;
+      }
+
+      list.push(candidate);
+      j++;
+    }
+
+    if (list.length >= 2 && list.length <= 30) {
+      const field = makeFieldName(heading);
+
+      if (field) {
+        results.push({
+          field,
+          data: uniqueValues(list)
+        });
+
+        consumedIndexes.add(i);
+
+        for (let k = i + 1; k < j; k++) {
+          consumedIndexes.add(k);
+        }
       }
     }
   }
 
-  return null;
-}
-
-// ============================================================
-// PHONES
-// ============================================================
-
-function extractPhones(data, text) {
-  const values = [];
-
-  collectObjectValues(
-    data,
-    [
-      "phone",
-      "phone_number",
-      "phoneNumber",
-      "telephone",
-      "mobile",
-      "mobile_number",
-      "mobileNumber",
-      "whatsapp",
-    ],
-    values
-  );
-
-  const textMatches = text.match(
-    /(?:\+?\d[\d\s().-]{7,}\d)/g
-  ) || [];
-
-  values.push(...textMatches);
-
-  return unique(
-    values
-      .map(normalizePhone)
-      .filter((phone) => phone)
-  );
-}
-
-function normalizePhone(value) {
-  const original = String(value).trim();
-
-  const digits = original.replace(/\D/g, "");
-
-  if (digits.length < 8 || digits.length > 15) {
-    return null;
-  }
-
-  return original;
-}
-
-// ============================================================
-// EMAILS
-// ============================================================
-
-function extractEmails(data, text) {
-  const values = [];
-
-  collectObjectValues(
-    data,
-    [
-      "email",
-      "emails",
-      "mail",
-      "contact_email",
-      "contactEmail",
-    ],
-    values
-  );
-
-  const matches =
-    text.match(
-      /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
-    ) || [];
-
-  values.push(...matches);
-
-  return unique(
-    values
-      .map((value) => String(value).trim().toLowerCase())
-      .filter((value) => value.includes("@"))
-  );
-}
-
-// ============================================================
-// ADDRESS
-// ============================================================
-
-function extractAddress(data, text) {
-  const direct = findObjectValue(
-    data,
-    [
-      "address",
-      "full_address",
-      "fullAddress",
-      "street_address",
-      "streetAddress",
-    ]
-  );
-
-  if (typeof direct === "string") {
-    return cleanTextValue(direct);
-  }
-
-  if (direct && typeof direct === "object") {
-    return direct;
-  }
-
-  const lines = getLines(text);
+  // -----------------------------------------------------------
+  // 11. Detect sentences containing obvious experience
+  // -----------------------------------------------------------
 
   for (const line of lines) {
-    const lower = line.toLowerCase();
+    const experienceMatch = line.match(
+      /\b(\d{1,3})\s*(?:\+?\s*)?(years?|yrs?)\b/i
+    );
 
-    if (
-      lower.includes("road") ||
-      lower.includes("street") ||
-      lower.includes("avenue") ||
-      lower.includes("nagar") ||
-      lower.includes("p.o") ||
-      lower.includes("pin") ||
-      lower.includes("postal")
-    ) {
-      if (line.length >= 15 && line.length <= 300) {
-        return line;
-      }
+    if (experienceMatch) {
+      results.push({
+        field: "experience",
+        data: `${experienceMatch[1]} years`
+      });
     }
   }
 
-  return null;
-}
+  // -----------------------------------------------------------
+  // 12. Detect remaining meaningful text
+  // -----------------------------------------------------------
 
-// ============================================================
-// SERVICES
-// ============================================================
+  const remaining = [];
 
-function extractServices(data, text) {
-  const values = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (consumedIndexes.has(i)) {
+      continue;
+    }
 
-  collectObjectValues(
-    data,
-    [
-      "services",
-      "service",
-      "treatments",
-      "treatment",
-      "facilities",
-      "offers",
-    ],
-    values
-  );
+    const line = lines[i];
 
-  const structured = flattenToStrings(values);
+    if (isJunkLine(line)) {
+      continue;
+    }
 
-  if (structured.length > 0) {
-    return cleanList(structured);
+    // Contact information already handled.
+    if (containsContactInformation(line)) {
+      continue;
+    }
+
+    // Very short UI/navigation items.
+    if (isLikelyNavigation(line)) {
+      continue;
+    }
+
+    remaining.push(line);
   }
 
-  // Find a "Services" section in plain text.
+  // -----------------------------------------------------------
+  // 13. Group meaningful remaining content
+  // -----------------------------------------------------------
 
-  const lines = getLines(text);
+  const meaningful = remaining.filter(line => {
+    if (line.length < 4) {
+      return false;
+    }
 
-  const headingIndex = findHeadingIndex(lines, [
-    "services",
-    "our services",
-    "services we offer",
-    "what we offer",
-    "treatments",
-    "facilities",
+    if (isJunkLine(line)) {
+      return false;
+    }
+
+    return true;
+  });
+
+  if (meaningful.length > 0) {
+    results.push({
+      field: "pending",
+      data: uniqueValues(meaningful)
+    });
+  }
+}
+
+
+// =============================================================
+// TEXT NORMALIZATION
+// =============================================================
+
+function normalizeText(text) {
+  return String(text)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\t+/g, " ")
+    .replace(/[ \u00A0]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
+
+function cleanLine(line) {
+  return String(line)
+    .replace(/\s+/g, " ")
+    .replace(/^[|•·▪▫►▶→]+/g, "")
+    .replace(/[|]+$/g, "")
+    .trim();
+}
+
+
+// =============================================================
+// JUNK DETECTION
+// =============================================================
+
+function isJunkLine(line) {
+  const normalized = line
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return true;
+  }
+
+  // HTML/code artifacts
+  if (
+    normalized === "-->" ||
+    normalized === "<!--" ||
+    normalized === "->"
+  ) {
+    return true;
+  }
+
+  if (
+    normalized.includes("<script") ||
+    normalized.includes("</script") ||
+    normalized.includes("<style") ||
+    normalized.includes("</style")
+  ) {
+    return true;
+  }
+
+  // Common footer/navigation junk.
+  const junkPatterns = [
+    /^copyright\b/,
+    /^all rights reserved\b/,
+    /^designed by\b/,
+    /^developed by\b/,
+    /^powered by\b/,
+    /^privacy policy$/,
+    /^terms and conditions$/,
+    /^terms of service$/,
+    /^cookie policy$/,
+    /^cookies$/,
+    /^sitemap$/,
+    /^home$/,
+    /^menu$/,
+    /^login$/,
+    /^sign in$/,
+    /^sign up$/,
+    /^register$/,
+    /^gallery$/,
+    /^contact us$/,
+    /^about us$/,
+    /^know more$/,
+    /^read more$/,
+    /^learn more$/,
+    /^view more$/,
+    /^view all$/,
+    /^book appointment$/,
+    /^book now$/,
+    /^get started$/,
+    /^subscribe$/,
+    /^follow us$/,
+    /^share$/,
+    /^next$/,
+    /^previous$/,
+    /^close$/,
+    /^search$/,
+    /^submit$/,
+    /^send$/,
+    /^loading$/,
+    /^javascript$/,
+    /^undefined$/,
+    /^null$/
+  ];
+
+  for (const pattern of junkPatterns) {
+    if (pattern.test(normalized)) {
+      return true;
+    }
+  }
+
+  // Very obvious CSS / JS garbage.
+  if (
+    normalized.includes("function(") ||
+    normalized.includes("=> {") ||
+    normalized.includes("var ") ||
+    normalized.includes("const ") ||
+    normalized.includes("document.") ||
+    normalized.includes("window.")
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+
+function isJunkField(field) {
+  const junk = new Set([
+    "id",
+    "created_at",
+    "updated_at",
+    "timestamp",
+    "metadata",
+    "html",
+    "raw_html",
+    "scripts",
+    "styles",
+    "css",
+    "javascript",
+    "class",
+    "class_name"
   ]);
 
-  if (headingIndex < 0) {
+  return junk.has(field);
+}
+
+
+// =============================================================
+// NAVIGATION DETECTION
+// =============================================================
+
+function isLikelyNavigation(line) {
+  const value = line.trim();
+
+  if (value.length > 50) {
+    return false;
+  }
+
+  const navigationWords = [
+    "home",
+    "about",
+    "services",
+    "contact",
+    "gallery",
+    "blog",
+    "menu",
+    "login",
+    "logout",
+    "register",
+    "sign in",
+    "sign up",
+    "book now",
+    "book appointment",
+    "get started",
+    "read more",
+    "know more",
+    "learn more",
+    "view more",
+    "view all"
+  ];
+
+  return navigationWords.includes(
+    value.toLowerCase()
+  );
+}
+
+
+// =============================================================
+// HEADING DETECTION
+// =============================================================
+
+function looksLikeHeading(line) {
+  const value = line.trim();
+
+  if (!value) {
+    return false;
+  }
+
+  if (value.length > 80) {
+    return false;
+  }
+
+  // A sentence with punctuation is less likely to be heading.
+  if (
+    value.endsWith(".") &&
+    value.split(" ").length > 4
+  ) {
+    return false;
+  }
+
+  // Common heading signal: title-like text.
+  const words = value.split(/\s+/);
+
+  if (words.length <= 8) {
+    return true;
+  }
+
+  return false;
+}
+
+
+function looksLikeLongSentence(line) {
+  return (
+    line.length > 100 ||
+    line.split(/\s+/).length > 18
+  );
+}
+
+
+// =============================================================
+// CONTACT DETECTION
+// =============================================================
+
+function containsContactInformation(value) {
+  return (
+    extractEmails(value).length > 0 ||
+    extractPhones(value).length > 0 ||
+    extractUrls(value).length > 0
+  );
+}
+
+
+function extractEmails(text) {
+  const matches = String(text).match(
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
+  );
+
+  return uniqueValues(matches || []);
+}
+
+
+function extractUrls(text) {
+  const matches = String(text).match(
+    /https?:\/\/[^\s<>"']+/gi
+  );
+
+  return uniqueValues(
+    (matches || []).map(url =>
+      url.replace(/[),.;]+$/g, "")
+    )
+  );
+}
+
+
+function extractPhones(text) {
+  const matches = String(text).match(
+    /(?:\+?\d[\d\s().-]{7,}\d)/g
+  );
+
+  if (!matches) {
     return [];
   }
 
-  const results = [];
-
-  for (
-    let i = headingIndex + 1;
-    i < Math.min(lines.length, headingIndex + 20);
-    i++
-  ) {
-    const line = lines[i];
-
-    if (isSectionHeading(line)) {
-      break;
-    }
-
-    if (
-      line.length >= 2 &&
-      line.length <= 100 &&
-      !isGenericPageWord(line)
-    ) {
-      results.push(line);
-    }
-  }
-
-  return cleanList(results);
-}
-
-// ============================================================
-// BOOKING URL
-// ============================================================
-
-function extractBookingUrl(data, text) {
-  const urls = extractUrlsFromObject(data);
-
-  for (const url of urls) {
-    if (
-      /book|appointment|reservation|reserve|schedule/i.test(
-        url
-      )
-    ) {
-      return url;
-    }
-  }
-
-  const textUrls = extractUrls(text);
-
-  for (const url of textUrls) {
-    if (
-      /book|appointment|reservation|reserve|schedule/i.test(
-        url
-      )
-    ) {
-      return url;
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// WHATSAPP
-// ============================================================
-
-function extractWhatsApp(data, text) {
-  const urls = extractUrlsFromObject(data);
-
-  for (const url of urls) {
-    if (
-      /wa\.me|whatsapp\.com/i.test(url)
-    ) {
-      return url;
-    }
-  }
-
-  const textUrls = extractUrls(text);
-
-  for (const url of textUrls) {
-    if (
-      /wa\.me|whatsapp\.com/i.test(url)
-    ) {
-      return url;
-    }
-  }
-
-  if (/book on whatsapp/i.test(text)) {
-    const phones = extractPhones(data, text);
-
-    if (phones.length > 0) {
-      return phones[0];
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// SOCIAL LINKS
-// ============================================================
-
-function extractSocialLinks(data, text) {
-  const urls = unique([
-    ...extractUrlsFromObject(data),
-    ...extractUrls(text),
-  ]);
-
-  const result = {};
-
-  for (const url of urls) {
-    const lower = url.toLowerCase();
-
-    if (lower.includes("instagram.com")) {
-      result.instagram = url;
-    } else if (lower.includes("facebook.com")) {
-      result.facebook = url;
-    } else if (
-      lower.includes("linkedin.com")
-    ) {
-      result.linkedin = url;
-    } else if (
-      lower.includes("youtube.com") ||
-      lower.includes("youtu.be")
-    ) {
-      result.youtube = url;
-    } else if (
-      lower.includes("twitter.com") ||
-      lower.includes("x.com")
-    ) {
-      result.twitter = url;
-    } else if (
-      lower.includes("tiktok.com")
-    ) {
-      result.tiktok = url;
-    }
-  }
-
-  return result;
-}
-
-// ============================================================
-// EXPERIENCE
-// ============================================================
-
-function extractExperience(text) {
-  const patterns = [
-    /(\d+)\s*\+?\s*years?\s+(?:of\s+)?(?:experience|expertise)/i,
-    /(\d+)\s*\+?\s*years?\s+(?:in|of)/i,
-    /(?:over|more than)\s+(\d+)\s+years?/i,
-    /(\d+)\s*years?\s+(?:traditional|rich)\s+experience/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-
-    if (match) {
-      return `${match[1]} years`;
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// NUMBER METRICS
-// ============================================================
-
-function extractMetric(text, keywords) {
-  for (const keyword of keywords) {
-    const escaped = escapeRegex(keyword);
-
-    const patterns = [
-      new RegExp(
-        `(\\d[\\d,]*)\\s*\\+?\\s*${escaped}`,
-        "i"
-      ),
-      new RegExp(
-        `${escaped}\\s*[:\\-]?\\s*(\\d[\\d,]*)`,
-        "i"
-      ),
-    ];
-
-    for (const pattern of patterns) {
-      const match = text.match(pattern);
-
-      if (match) {
-        const number = Number(
-          match[1].replace(/,/g, "")
-        );
-
-        if (Number.isFinite(number)) {
-          return number;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// PAYMENT METHODS
-// ============================================================
-
-function extractPaymentMethods(text) {
-  const methods = [];
-
-  const known = [
-    ["credit card", "credit card"],
-    ["debit card", "debit card"],
-    ["net banking", "net banking"],
-    ["upi", "UPI"],
-    ["paypal", "PayPal"],
-    ["cash", "cash"],
-  ];
-
-  for (const [search, value] of known) {
-    if (text.toLowerCase().includes(search)) {
-      methods.push(value);
-    }
-  }
-
-  return unique(methods);
-}
-
-// ============================================================
-// OPENING HOURS
-// ============================================================
-
-function extractOpeningHours(text) {
-  const lines = getLines(text);
-  const results = [];
-
-  for (const line of lines) {
-    if (
-      /\b(mon|monday|tue|tuesday|wed|wednesday|thu|thursday|fri|friday|sat|saturday|sun|sunday)\b/i.test(
-        line
-      ) &&
-      /\d{1,2}[:.]\d{2}/.test(line)
-    ) {
-      results.push(line);
-    }
-  }
-
-  return unique(results);
-}
-
-// ============================================================
-// OBJECT HELPERS
-// ============================================================
-
-function findObjectValue(object, keys) {
-  const wanted = new Set(
-    keys.map((key) => key.toLowerCase())
-  );
-
-  function search(value, depth = 0) {
-    if (depth > 10 || value === null || value === undefined) {
-      return null;
-    }
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        const found = search(item, depth + 1);
-
-        if (found !== null && found !== undefined) {
-          return found;
-        }
-      }
-
-      return null;
-    }
-
-    if (typeof value !== "object") {
-      return null;
-    }
-
-    for (const [key, child] of Object.entries(value)) {
-      if (
-        wanted.has(key.toLowerCase()) &&
-        child !== null &&
-        child !== undefined &&
-        child !== ""
-      ) {
-        return child;
-      }
-    }
-
-    for (const child of Object.values(value)) {
-      const found = search(child, depth + 1);
-
-      if (found !== null && found !== undefined) {
-        return found;
-      }
-    }
-
-    return null;
-  }
-
-  return search(object);
-}
-
-function collectObjectValues(object, keys, output) {
-  const wanted = new Set(
-    keys.map((key) => key.toLowerCase())
-  );
-
-  function walk(value, depth = 0) {
-    if (depth > 10 || value === null || value === undefined) {
-      return;
-    }
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        walk(item, depth + 1);
-      }
-
-      return;
-    }
-
-    if (typeof value !== "object") {
-      return;
-    }
-
-    for (const [key, child] of Object.entries(value)) {
-      if (wanted.has(key.toLowerCase())) {
-        output.push(child);
-      }
-
-      walk(child, depth + 1);
-    }
-  }
-
-  walk(object);
-}
-
-function flattenToStrings(value) {
-  const result = [];
-
-  function walk(item, depth = 0) {
-    if (depth > 10 || item === null || item === undefined) {
-      return;
-    }
-
-    if (typeof item === "string") {
-      const value = cleanTextValue(item);
-
-      if (value) {
-        result.push(value);
-      }
-
-      return;
-    }
-
-    if (
-      typeof item === "number" ||
-      typeof item === "boolean"
-    ) {
-      result.push(String(item));
-      return;
-    }
-
-    if (Array.isArray(item)) {
-      for (const child of item) {
-        walk(child, depth + 1);
-      }
-
-      return;
-    }
-
-    if (typeof item === "object") {
-      for (const child of Object.values(item)) {
-        walk(child, depth + 1);
-      }
-    }
-  }
-
-  walk(value);
-
-  return result;
-}
-
-// ============================================================
-// URL HELPERS
-// ============================================================
-
-function extractUrls(text) {
-  const matches =
-    text.match(
-      /https?:\/\/[^\s"'<>]+/gi
-    ) || [];
-
-  return unique(
-    matches.map((url) =>
-      url.replace(/[),.;]+$/, "")
-    )
-  );
-}
-
-function extractUrlsFromObject(data) {
-  const text = extractAllText(data);
-
-  return extractUrls(text);
-}
-
-// ============================================================
-// TEXT HELPERS
-// ============================================================
-
-function cleanTextValue(value) {
-  return String(value || "")
-    .replace(/\r/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n\s*\n+/g, "\n")
-    .trim()
-    .slice(0, MAX_TEXT_CHARS);
-}
-
-function getLines(text) {
-  return String(text)
-    .split("\n")
-    .map((line) =>
-      line
-        .replace(/\s+/g, " ")
-        .trim()
-    )
-    .filter(Boolean);
-}
-
-function findHeadingIndex(lines, headings) {
-  const normalized = headings.map((value) =>
-    value.toLowerCase()
-  );
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].toLowerCase().trim();
-
-    if (normalized.includes(line)) {
-      return i;
-    }
-  }
-
-  return -1;
-}
-
-function isSectionHeading(line) {
-  const value = line.toLowerCase().trim();
-
-  const headings = [
-    "home",
-    "about",
-    "about us",
-    "services",
-    "our services",
-    "contact",
-    "contact us",
-    "gallery",
-    "facilities",
-    "location",
-    "menu",
-    "book appointment",
-    "booking",
-    "offers",
-    "events",
-    "rooms",
-    "dining",
-  ];
-
-  return headings.includes(value);
-}
-
-function isGenericPageWord(value) {
-  const lower = value.toLowerCase().trim();
-
-  return [
-    "home",
-    "about",
-    "about us",
-    "contact",
-    "contact us",
-    "services",
-    "our services",
-    "gallery",
-    "menu",
-    "booking",
-    "book appointment",
-    "login",
-    "register",
-  ].includes(lower);
-}
-
-function cleanList(values) {
-  return unique(
-    values
-      .map((value) =>
-        String(value)
-          .replace(/^[•\-–—*]+\s*/, "")
+  return uniqueValues(
+    matches
+      .map(phone =>
+        phone
           .replace(/\s+/g, " ")
           .trim()
       )
-      .filter((value) => {
-        return (
-          value.length >= 2 &&
-          value.length <= 150 &&
-          !isGenericPageWord(value)
-        );
+      .filter(phone => {
+        const digits = phone.replace(/\D/g, "");
+        return digits.length >= 8 && digits.length <= 15;
       })
   );
 }
 
-function unique(values) {
-  const seen = new Set();
+
+// =============================================================
+// FIELD NAME GENERATION
+// =============================================================
+
+function makeFieldName(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+  let field = String(value)
+    .trim()
+    .toLowerCase();
+
+  // Replace symbols with spaces.
+  field = field
+    .replace(/&/g, " and ")
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+  // Convert to snake_case.
+  field = field
+    .split(/\s+/)
+    .filter(Boolean)
+    .join("_");
+
+  // Avoid huge field names.
+  if (field.length > 100) {
+    field = field.slice(0, 100);
+  }
+
+  return field;
+}
+
+
+// =============================================================
+// VALUE CLEANING
+// =============================================================
+
+function cleanValue(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return value;
+  }
+
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  const text = String(value)
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) {
+    return null;
+  }
+
+  return text;
+}
+
+
+function cleanArray(array) {
   const result = [];
 
-  for (const value of values) {
-    const key = String(value).toLowerCase().trim();
+  for (const item of array) {
+    if (
+      item === null ||
+      item === undefined
+    ) {
+      continue;
+    }
 
-    if (!key || seen.has(key)) {
+    if (
+      typeof item === "object"
+    ) {
+      result.push(item);
+      continue;
+    }
+
+    const cleaned = cleanValue(item);
+
+    if (
+      cleaned !== null &&
+      cleaned !== undefined &&
+      String(cleaned).trim() !== ""
+    ) {
+      result.push(cleaned);
+    }
+  }
+
+  return uniqueValues(result);
+}
+
+
+// =============================================================
+// NUMBER PARSING
+// =============================================================
+
+function parseNumber(value) {
+  const cleaned = String(value)
+    .replace(/,/g, "")
+    .trim();
+
+  const number = Number(cleaned);
+
+  if (Number.isFinite(number)) {
+    return number;
+  }
+
+  return value;
+}
+
+
+// =============================================================
+// DEDUPLICATION
+// =============================================================
+
+function uniqueValues(values) {
+  const seen = new Set();
+  const output = [];
+
+  for (const value of values || []) {
+    const key =
+      typeof value === "object"
+        ? JSON.stringify(value)
+        : String(value)
+            .trim()
+            .toLowerCase();
+
+    if (seen.has(key)) {
       continue;
     }
 
     seen.add(key);
-    result.push(value);
+    output.push(value);
   }
 
-  return result;
+  return output;
 }
 
-function escapeRegex(value) {
-  return String(value).replace(
-    /[.*+?^${}()|[\]\\]/g,
-    "\\$&"
-  );
+
+// =============================================================
+// RESULT CLEANING
+// =============================================================
+
+function cleanResults(results) {
+  const grouped = new Map();
+
+  for (const item of results) {
+    if (
+      !item ||
+      !item.field
+    ) {
+      continue;
+    }
+
+    const field = makeFieldName(item.field);
+
+    if (!field) {
+      continue;
+    }
+
+    if (
+      item.data === null ||
+      item.data === undefined
+    ) {
+      continue;
+    }
+
+    const cleanedData =
+      cleanValueDeep(item.data);
+
+    if (
+      cleanedData === null ||
+      cleanedData === undefined
+    ) {
+      continue;
+    }
+
+    if (!grouped.has(field)) {
+      grouped.set(field, []);
+    }
+
+    grouped.get(field).push(cleanedData);
+  }
+
+  const output = [];
+
+  for (const [field, values] of grouped.entries()) {
+    // ---------------------------------------------------------
+    // Merge multiple values for the same field.
+    // ---------------------------------------------------------
+
+    if (field === "pending") {
+      const flattened = [];
+
+      for (const value of values) {
+        if (Array.isArray(value)) {
+          flattened.push(...value);
+        } else {
+          flattened.push(value);
+        }
+      }
+
+      const unique = uniqueValues(flattened);
+
+      if (unique.length > 0) {
+        output.push({
+          field,
+          data: unique
+        });
+      }
+
+      continue;
+    }
+
+    // If there is only one value, keep it simple.
+    if (values.length === 1) {
+      output.push({
+        field,
+        data: values[0]
+      });
+
+      continue;
+    }
+
+    // Multiple values.
+    const flattened = [];
+
+    for (const value of values) {
+      if (Array.isArray(value)) {
+        flattened.push(...value);
+      } else {
+        flattened.push(value);
+      }
+    }
+
+    output.push({
+      field,
+      data: uniqueValues(flattened)
+    });
+  }
+
+  return output;
 }
 
-// ============================================================
-// SUPABASE
-// ============================================================
+
+function cleanValueDeep(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map(item => cleanValueDeep(item))
+      .filter(
+        item =>
+          item !== null &&
+          item !== undefined &&
+          item !== ""
+      );
+  }
+
+  if (
+    value &&
+    typeof value === "object"
+  ) {
+    const result = {};
+
+    for (const [key, val] of Object.entries(value)) {
+      const cleaned = cleanValueDeep(val);
+
+      if (
+        cleaned !== null &&
+        cleaned !== undefined &&
+        cleaned !== ""
+      ) {
+        result[key] = cleaned;
+      }
+    }
+
+    return result;
+  }
+
+  if (typeof value === "string") {
+    return cleanValue(value);
+  }
+
+  return value;
+}
+
+
+// =============================================================
+// SUPABASE HELPERS
+// =============================================================
 
 function supabaseHeaders(env) {
   return {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
+    Authorization:
+      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json"
   };
 }
 
+
+// =============================================================
+// UPDATE business_data STATUS
+// =============================================================
+
 async function updateBusinessDataStatus(
+  env,
   id,
   status,
-  errorMessage,
-  env
+  errorMessage
 ) {
   const url =
-    `${env.SUPABASE_URL}/rest/v1/business_data` +
-    `?id=eq.${encodeURIComponent(id)}`;
+    `${env.SUPABASE_URL}/rest/v1/business_data?id=eq.${encodeURIComponent(id)}`;
+
+  const body = {
+    ai_status: status,
+    ai_error: errorMessage || null,
+    updated_at: new Date().toISOString()
+  };
 
   const response = await fetch(url, {
     method: "PATCH",
     headers: {
       ...supabaseHeaders(env),
-      Prefer: "return=minimal",
+      Prefer: "return=minimal"
     },
-    body: JSON.stringify({
-      ai_status: status,
-      ai_error: errorMessage || null,
-      updated_at: new Date().toISOString(),
-    }),
+    body: JSON.stringify(body)
   });
 
   if (!response.ok) {
-    const body = await response.text();
+    const errorText = await response.text();
 
-    throw new Error(
-      `Failed to update business_data status: ${response.status} ${body}`
+    console.error(
+      "Failed to update business_data status:",
+      errorText
     );
   }
 }
 
-// ============================================================
-// SAVE KNOWLEDGE
-// ============================================================
 
-async function saveKnowledge({
+// =============================================================
+// UPSERT BUSINESS KNOWLEDGE
+// =============================================================
+
+async function upsertKnowledge(
+  env,
   applicationId,
   field,
   data,
-  sourceUrl,
-  env,
-}) {
-  const existingUrl =
+  sourceUrl
+) {
+  // -----------------------------------------------------------
+  // 1. Find existing field
+  // -----------------------------------------------------------
+
+  const selectUrl =
     `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
     `?application_id=eq.${encodeURIComponent(applicationId)}` +
     `&field=eq.${encodeURIComponent(field)}` +
-    `&select=id,data,source_urls`;
+    `&select=*`;
 
-  const existingResponse = await fetch(existingUrl, {
+  const selectResponse = await fetch(selectUrl, {
     method: "GET",
-    headers: supabaseHeaders(env),
+    headers: supabaseHeaders(env)
   });
 
-  if (!existingResponse.ok) {
-    const body = await existingResponse.text();
+  if (!selectResponse.ok) {
+    const errorText =
+      await selectResponse.text();
 
     throw new Error(
-      `Failed to check existing knowledge: ${existingResponse.status} ${body}`
+      `Failed to find business_knowledge row: ${errorText}`
     );
   }
 
-  const existingRows = await existingResponse.json();
+  const existingRows =
+    await selectResponse.json();
 
-  // ----------------------------------------------------------
-  // EXISTING FIELD → UPDATE
-  // ----------------------------------------------------------
+  // -----------------------------------------------------------
+  // 2. Create new row
+  // -----------------------------------------------------------
 
-  if (existingRows.length > 0) {
-    const existing = existingRows[0];
+  if (
+    !Array.isArray(existingRows) ||
+    existingRows.length === 0
+  ) {
+    const now =
+      new Date().toISOString();
 
-    const mergedData = mergeKnowledgeData(
+    const insertBody = {
+      application_id: applicationId,
+      field,
+      data,
+      created_at: now,
+      updated_at: now,
+      source_urls: sourceUrl
+        ? [sourceUrl]
+        : []
+    };
+
+    const insertUrl =
+      `${env.SUPABASE_URL}/rest/v1/business_knowledge`;
+
+    const insertResponse = await fetch(
+      insertUrl,
+      {
+        method: "POST",
+        headers: {
+          ...supabaseHeaders(env),
+          Prefer: "return=minimal"
+        },
+        body: JSON.stringify(insertBody)
+      }
+    );
+
+    if (!insertResponse.ok) {
+      const errorText =
+        await insertResponse.text();
+
+      throw new Error(
+        `Failed to insert business_knowledge: ${errorText}`
+      );
+    }
+
+    return;
+  }
+
+  // -----------------------------------------------------------
+  // 3. Update existing row
+  // -----------------------------------------------------------
+
+  const existing =
+    existingRows[0];
+
+  const mergedData =
+    mergeKnowledgeData(
       existing.data,
       data
     );
 
-    const sourceUrls = mergeSourceUrls(
-      existing.source_urls,
-      sourceUrl
-    );
+  const existingUrls =
+    Array.isArray(existing.source_urls)
+      ? existing.source_urls
+      : [];
 
-    const updateUrl =
-      `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
-      `?id=eq.${encodeURIComponent(existing.id)}`;
+  const mergedUrls =
+    uniqueValues([
+      ...existingUrls,
+      ...(sourceUrl ? [sourceUrl] : [])
+    ]);
 
-    const updateResponse = await fetch(updateUrl, {
+  const updateBody = {
+    data: mergedData,
+    source_urls: mergedUrls,
+    updated_at:
+      new Date().toISOString()
+  };
+
+  const updateUrl =
+    `${env.SUPABASE_URL}/rest/v1/business_knowledge` +
+    `?id=eq.${encodeURIComponent(existing.id)}`;
+
+  const updateResponse = await fetch(
+    updateUrl,
+    {
       method: "PATCH",
       headers: {
         ...supabaseHeaders(env),
-        Prefer: "return=minimal",
+        Prefer: "return=minimal"
       },
-      body: JSON.stringify({
-        data: mergedData,
-        source_urls: sourceUrls,
-        updated_at: new Date().toISOString(),
-      }),
-    });
-
-    if (!updateResponse.ok) {
-      const body = await updateResponse.text();
-
-      throw new Error(
-        `Failed to update business_knowledge: ${updateResponse.status} ${body}`
-      );
+      body: JSON.stringify(updateBody)
     }
-
-    console.log(
-      "Updated knowledge:",
-      field
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // NEW FIELD → INSERT
-  // ----------------------------------------------------------
-
-  const insertUrl =
-    `${env.SUPABASE_URL}/rest/v1/business_knowledge`;
-
-  const insertResponse = await fetch(insertUrl, {
-    method: "POST",
-    headers: {
-      ...supabaseHeaders(env),
-      Prefer: "return=minimal",
-    },
-    body: JSON.stringify({
-      application_id: applicationId,
-      field,
-      data,
-      source_urls: sourceUrl
-        ? [sourceUrl]
-        : [],
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }),
-  });
-
-  if (insertResponse.ok) {
-    console.log(
-      "Inserted knowledge:",
-      field
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------------
-  // RACE CONDITION RETRY
-  // ----------------------------------------------------------
-
-  const body = await insertResponse.text();
-
-  if (insertResponse.status === 409) {
-    console.log(
-      "Knowledge appeared during insert; retrying:",
-      field
-    );
-
-    await saveKnowledge({
-      applicationId,
-      field,
-      data,
-      sourceUrl,
-      env,
-    });
-
-    return;
-  }
-
-  throw new Error(
-    `Failed to insert business_knowledge: ${insertResponse.status} ${body}`
   );
+
+  if (!updateResponse.ok) {
+    const errorText =
+      await updateResponse.text();
+
+    throw new Error(
+      `Failed to update business_knowledge: ${errorText}`
+    );
+  }
 }
 
-// ============================================================
-// MERGE KNOWLEDGE
-// ============================================================
 
-function mergeKnowledgeData(oldData, newData) {
+// =============================================================
+// MERGE KNOWLEDGE DATA
+// =============================================================
+
+function mergeKnowledgeData(
+  oldData,
+  newData
+) {
+  // -----------------------------------------------------------
+  // Arrays
+  // -----------------------------------------------------------
+
   if (
     Array.isArray(oldData) &&
     Array.isArray(newData)
   ) {
-    return unique([
+    return uniqueValues([
       ...oldData,
-      ...newData,
+      ...newData
     ]);
   }
 
+  // -----------------------------------------------------------
+  // Objects
+  // -----------------------------------------------------------
+
   if (
+    oldData &&
     typeof oldData === "object" &&
-    oldData !== null &&
-    typeof newData === "object" &&
-    newData !== null &&
     !Array.isArray(oldData) &&
+    newData &&
+    typeof newData === "object" &&
     !Array.isArray(newData)
   ) {
     return {
       ...oldData,
-      ...newData,
+      ...newData
     };
   }
 
-  // New data is more recent.
+  // -----------------------------------------------------------
+  // Scalar values
+  //
+  // Newer information replaces older information.
+  // -----------------------------------------------------------
+
   return newData;
 }
 
-function mergeSourceUrls(existing, newUrl) {
-  const urls = Array.isArray(existing)
-    ? [...existing]
-    : [];
 
-  if (newUrl) {
-    urls.push(newUrl);
-  }
+// =============================================================
+// JSON RESPONSE
+// =============================================================
 
-  return unique(urls);
-}
-
-// ============================================================
-// RESPONSE HELPERS
-// ============================================================
-
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  };
-}
-
-function json(data, status = 200) {
+function jsonResponse(data, status = 200) {
   return new Response(
     JSON.stringify(data, null, 2),
     {
       status,
       headers: {
-        ...corsHeaders(),
-        "Content-Type": "application/json",
-      },
+        "Content-Type": "application/json"
+      }
     }
   );
         }
